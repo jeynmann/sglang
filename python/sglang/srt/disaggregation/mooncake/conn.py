@@ -403,7 +403,7 @@ class MooncakeKVManager(CommonKVManager):
         deferred=True means caller should re-enqueue and break.
         """
         _tp = self.attn_tp_rank
-        ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
+        ready, chunk_idx, c_offset, _c_round, c_end = staging_strategy.check_ready(
             req,
             kv_chunk.index_slice.start,
             len(kv_chunk.prefill_kv_indices),
@@ -420,11 +420,12 @@ class MooncakeKVManager(CommonKVManager):
             queue.put(kv_chunk)
             return (-1, True)
 
+        dst_staging_size = c_end - c_offset
         ret = staging_strategy.transfer(
             req.mooncake_session_id,
             kv_chunk.prefill_kv_indices,
             target_info.staging.base_ptr + c_offset,
-            target_info.staging.total_size - c_offset,
+            dst_staging_size,
             target_info,
         )
         if ret == -1:
