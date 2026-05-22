@@ -1,15 +1,28 @@
 #!/usr/bin/env python3
 
+import hashlib
 import os
 import unittest
+import warnings
 from typing import List
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+# HiCacheController pulls in torch._inductor, which imports torch.utils.mkldnn
+# and emits a DeprecationWarning for torch.jit.script_method during collection.
+warnings.filterwarnings(
+    "ignore",
+    message=r"`torch\.jit\.script_method` is deprecated",
+    category=DeprecationWarning,
+)
 
 import torch
 
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
+    NixlBackendConfig,
+    NixlBackendSelection,
     NixlFileManager,
     NixlRegistration,
 )
@@ -17,6 +30,157 @@ from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
 
 class TestNixlUnified(unittest.TestCase):
     """Unified test suite for all NIXL components."""
+
+    def test_obj_reg_tuple_default(self):
+        self.assertEqual(
+            HiCacheNixl._obj_reg_tuple_default("key-a"), (0, 0, "key-a", "")
+        )
+
+    def test_obj_reg_tuple_doca_memos(self):
+        key = "cache/key"
+        digest = hashlib.sha256(key.encode("utf-8")).digest()
+        meta = digest.hex()[:32]
+        dev_id = int.from_bytes(digest[:8], "big")
+        self.assertEqual(
+            HiCacheNixl._obj_reg_tuple_doca_memos(key), (0, 0, dev_id, meta)
+        )
+
+    def test_format_key_doca_memos(self):
+        k = "some/cache/key@suffix"
+        formatted = hashlib.sha256(k.encode("utf-8")).hexdigest()[:32]
+        self.assertEqual(HiCacheNixl._format_key_doca_memos(k), formatted)
+
+    def _make_hicache(self, extra_config: dict) -> HiCacheNixl:
+        def _stub_create_backend(selector_self, agent):
+            selector_self.backend_name = selector_self.plugin
+            selector_self.mem_type = (
+                "OBJ"
+                if selector_self.backend_name in NixlBackendSelection.OBJ_PLUGINS
+                else "FILE"
+            )
+            return True
+
+        storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+            extra_config=extra_config,
+        )
+        with (
+            patch(
+                "sglang.srt.mem_cache.storage.nixl.hicache_nixl.nixl_agent",
+                return_value=MagicMock(),
+            ),
+            patch.object(NixlBackendSelection, "create_backend", _stub_create_backend),
+        ):
+            return HiCacheNixl(storage_config=storage_config, file_path=self.test_dir)
+
+    def test_format_key_backend_routing(self):
+        """HiCacheNixl.__init__ binds _format_key from backend_selector.backend_name."""
+        key = "some/cache/key@suffix"
+        cases = (
+            (
+                "OBJ",
+                {"plugin": {"obj": {"active": True}}},
+                HiCacheNixl._format_key_default,
+                HiCacheNixl._obj_reg_tuple_default,
+                False,
+            ),
+            (
+                "DOCA_MEMOS",
+                {"plugin": {"doca_memos": {"active": True}}},
+                HiCacheNixl._format_key_doca_memos,
+                HiCacheNixl._obj_reg_tuple_doca_memos,
+                True,
+            ),
+        )
+        for backend, extra, fmt_fn, reg_fn, exp_hugepages in cases:
+            with self.subTest(backend=backend):
+                hicache = self._make_hicache(extra)
+                sel = hicache.backend_selector
+
+                self.assertEqual(sel.backend_name, backend)
+                self.assertEqual(sel.mem_type, "OBJ")
+                self.assertEqual(hicache._format_key(key), fmt_fn(key))
+                self.assertEqual(hicache._obj_reg_tuple(key), reg_fn(key))
+                self.assertEqual(hicache._require_host_hugepages, exp_hugepages)
+
+    def test_nixl_backend_config_use_host_hugepages(self):
+        self.assertFalse(NixlBackendConfig({}).use_host_hugepages())
+        self.assertTrue(
+            NixlBackendConfig({"use_host_hugepages": True}).use_host_hugepages()
+        )
+        self.assertTrue(
+            NixlBackendConfig({"use_host_hugepages": "true"}).use_host_hugepages()
+        )
+        self.assertFalse(
+            NixlBackendConfig({"use_host_hugepages": False}).use_host_hugepages()
+        )
+
+    def test_parse_storage_batch_size(self):
+        self.assertEqual(HiCacheController._parse_storage_batch_size({}), 128)
+        extra = {"storage_batch_size": 64}
+        self.assertEqual(HiCacheController._parse_storage_batch_size(extra), 64)
+        extra = {"storage_batch_size": 0}
+        self.assertRaises(
+            ValueError, HiCacheController._parse_storage_batch_size, extra
+        )
+
+    def test_doca_memos_backend_requires_hugepages_and_meminfo(self):
+        agent = MagicMock()
+        agent.get_plugin_list.return_value = ["DOCA_MEMOS"]
+        agent.get_backend_params.return_value = {}
+        # use_host_hugepages = False
+        selector = NixlBackendSelection(
+            plugin="DOCA_MEMOS",
+            nixlconfig=NixlBackendConfig({"use_host_hugepages": False}),
+        )
+        self.assertFalse(selector.create_backend(agent))
+        agent.create_backend.assert_not_called()
+        # use_host_hugepages = True, validate_meminfo = False
+        selector = NixlBackendSelection(
+            plugin="DOCA_MEMOS",
+            nixlconfig=NixlBackendConfig({"use_host_hugepages": True}),
+        )
+        with patch(
+            "sglang.srt.mem_cache.storage.nixl.hugepage_util.HugepageUtil.validate_meminfo",
+            return_value=False,
+        ):
+            self.assertFalse(selector.create_backend(agent))
+        agent.create_backend.assert_not_called()
+        # use_host_hugepages = True, validate_meminfo = True
+        selector = NixlBackendSelection(
+            plugin="DOCA_MEMOS",
+            nixlconfig=NixlBackendConfig({"use_host_hugepages": True}),
+        )
+        with patch(
+            "sglang.srt.mem_cache.storage.nixl.hugepage_util.HugepageUtil.validate_meminfo",
+            return_value=True,
+        ):
+            self.assertTrue(selector.create_backend(agent))
+        agent.create_backend.assert_called()
+
+    def test_hicache_nixl_requires_host_hugepages(self):
+        host_pool = MagicMock()
+        host_pool.use_host_hugepages = False
+        fake = type("FakeHiCache", (), {"_require_host_hugepages": True})()
+        # _require_host_hugepages = True, use_host_hugepages = False
+        with self.assertRaises(RuntimeError):
+            HiCacheNixl._assert_doca_memos_host_hugepages(fake, host_pool)
+        # _require_host_hugepages = False, use_host_hugepages = False
+        fake._require_host_hugepages = False
+        HiCacheNixl._assert_doca_memos_host_hugepages(fake, host_pool)
+        # _require_host_hugepages = True, use_host_hugepages = True
+        fake._require_host_hugepages = True
+        host_pool.use_host_hugepages = True
+        HiCacheNixl._assert_doca_memos_host_hugepages(fake, host_pool)
 
     def setUp(self):
         """Set up test environment."""
@@ -49,17 +213,34 @@ class TestNixlUnified(unittest.TestCase):
             extra_config={"plugin": {"posix": {"active": True}}},
         )
 
+        self.hicache = None
+        tests_skip_hicache_init = {
+            "test_obj_reg_tuple_default",
+            "test_obj_reg_tuple_doca_memos",
+            "test_format_key_doca_memos",
+            "test_format_key_backend_routing",
+            "test_nixl_backend_config_use_host_hugepages",
+            "test_parse_storage_batch_size",
+            "test_doca_memos_backend_requires_hugepages_and_meminfo",
+            "test_hicache_nixl_requires_host_hugepages",
+            "test_basic_file_operations",
+            "test_create_nixl_tuples",
+            "test_error_handling",
+        }
+        if self._testMethodName in tests_skip_hicache_init:
+            return
+
         try:
             self.hicache = HiCacheNixl(
                 storage_config=self.storage_config,
                 file_path=self.test_dir,
             )
-            self.hicache = HiCacheNixl(storage_config=self.storage_config)
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
 
     def tearDown(self):
         """Clean up test directories."""
+        self.hicache = None
         if os.path.exists(self.test_dir):
             import shutil
 
@@ -130,11 +311,11 @@ class TestNixlUnified(unittest.TestCase):
         )
 
         # Test set
-        self.assertTrue(self.hicache.set(key, None, src_addr, src_len))
-        self.assertTrue(self.hicache.exists(key))
+        self.assertTrue(self.hicache.set(key2, None, src_addr, src_len))
+        self.assertTrue(self.hicache.exists(key2))
 
         # Test get
-        retrieved2 = self.hicache.get(key, dst_addr, dst_len)
+        retrieved2 = self.hicache.get(key2, dst_addr, dst_len)
         self.assertTrue(retrieved2 is None)
         self.verify_tensors_equal(value, dst_tensor2)
 
@@ -169,7 +350,7 @@ class TestNixlUnified(unittest.TestCase):
         self.assertTrue(all(self.hicache.exists(key) for key in keys2))
 
         # Test batch get
-        retrieved2 = self.hicache.batch_get(keys, dst_addrs, dst_lens)
+        retrieved2 = self.hicache.batch_get(keys2, dst_addrs, dst_lens)
         self.assertTrue(all(ret is None for ret in retrieved2))
         self.verify_tensor_lists_equal(values, dst_tensors2)
 

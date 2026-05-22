@@ -73,6 +73,18 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
+        (
+            extra_config,
+            prefetch_threshold,
+            prefetch_timeout_config,
+            hicache_storage_pass_prefix_keys,
+        ) = self._parse_storage_backend_extra_config(
+            server_args.hicache_storage_backend_extra_config
+        )
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlBackendConfig
+
+        use_host_hugepages = NixlBackendConfig(extra_config).use_host_hugepages()
+
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
@@ -81,6 +93,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                use_host_hugepages=use_host_hugepages,
             )
         elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
@@ -93,6 +106,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                use_host_hugepages=use_host_hugepages,
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
@@ -106,15 +120,6 @@ class HiRadixCache(RadixCache):
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
-
-        (
-            extra_config,
-            prefetch_threshold,
-            prefetch_timeout_config,
-            hicache_storage_pass_prefix_keys,
-        ) = self._parse_storage_backend_extra_config(
-            server_args.hicache_storage_backend_extra_config
-        )
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
