@@ -97,6 +97,11 @@ class HostTensorAllocator(abc.ABC):
         tensor = torch.empty(dims, dtype=dtype, device=device)
         return tensor
 
+    @property
+    def use_host_hugepages(self) -> bool:
+        """True when allocations use Linux hugetlb-backed host memory (see NIXL allocator)."""
+        return False
+
 
 class HiSparseHostPoolMixin:
     def _round_up_to_page_size(self, size: int) -> int:
