@@ -1864,6 +1864,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
+        use_host_hugepages: bool = False,
     ):
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
@@ -1873,7 +1874,9 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         self.dtype = torch.uint8
         self.device = device
         self.pin_memory = pin_memory
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = get_allocator_from_storage(
+            allocator_type, use_host_hugepages=use_host_hugepages
+        )
         self.page_size = slot_page_size
         self.size = num_host_pages * slot_page_size
         self.layout = layout
@@ -1886,14 +1889,19 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         self.gpu_device = device_buffers[0].device if device_buffers else device
 
         requested_bytes = self.layer_num * num_host_pages * self.item_bytes
-        host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for V4 paged pool {pool_name}. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
+        if self.use_host_hugepages:
+            _require_hugepages(
+                requested_bytes, label=f"HiCache V4 paged pool '{pool_name}': "
             )
+        else:
+            host_mem = psutil.virtual_memory()
+            available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+            if requested_bytes > available_bytes:
+                raise ValueError(
+                    f"Not enough host memory for V4 paged pool {pool_name}. "
+                    f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                    f"{available_bytes / 1e9:.2f} GB free."
+                )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
         self.data_refs = []
@@ -1928,15 +1936,17 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
+        hp = " using hugepages" if self.use_host_hugepages else ""
         logger.info(
             "Allocating %.2f GB host memory for V4 paged pool '%s' "
-            "(layers=%d, pages=%d, item_bytes=%d, layout=%s).",
+            "(layers=%d, pages=%d, item_bytes=%d, layout=%s)%s.",
             requested_bytes / 1e9,
             self.pool_name,
             self.layer_num,
             num_host_pages,
             self.item_bytes,
             self.layout,
+            hp,
         )
 
         self.device_ptrs = torch.tensor(
@@ -2166,6 +2176,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
+        use_host_hugepages: bool = False,
     ):
         if any(pool is None for pool in state_pools):
             raise ValueError(f"{pool_name} state_pools must not contain None")
@@ -2178,7 +2189,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.dtype = torch.uint8
         self.device = device
         self.pin_memory = pin_memory
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = get_allocator_from_storage(
+            allocator_type, use_host_hugepages=use_host_hugepages
+        )
         self.page_size = swa_page_size
         self.size = num_host_pages * swa_page_size
         self.layout = layout
@@ -2194,14 +2207,19 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.size_per_token = self.state_page_bytes
 
         requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
-        host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for V4 state pool {pool_name}. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
+        if self.use_host_hugepages:
+            _require_hugepages(
+                requested_bytes, label=f"HiCache V4 state pool '{pool_name}': "
             )
+        else:
+            host_mem = psutil.virtual_memory()
+            available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+            if requested_bytes > available_bytes:
+                raise ValueError(
+                    f"Not enough host memory for V4 state pool {pool_name}. "
+                    f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                    f"{available_bytes / 1e9:.2f} GB free."
+                )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
         self.data_refs = []
@@ -2235,15 +2253,17 @@ class DeepSeekV4StateHostPool(HostKVCache):
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
+        hp = " using hugepages" if self.use_host_hugepages else ""
         logger.info(
             "Allocating %.2f GB host memory for V4 state pool '%s' "
-            "(layers=%d, pages=%d, state_page_bytes=%d, layout=%s).",
+            "(layers=%d, pages=%d, state_page_bytes=%d, layout=%s)%s.",
             requested_bytes / 1e9,
             self.pool_name,
             self.layer_num,
             num_host_pages,
             self.state_page_bytes,
             self.layout,
+            hp,
         )
         self.device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.device_page_views],
@@ -2532,7 +2552,10 @@ class HostPoolGroup:
 
     @property
     def use_host_hugepages(self) -> bool:
-        return getattr(self.anchor_entry.host_pool, "use_host_hugepages", False)
+        for entry in self.entries:
+            if getattr(entry.host_pool, "use_host_hugepages", False):
+                return True
+        return False
 
     @property
     def kv_buffer(self):

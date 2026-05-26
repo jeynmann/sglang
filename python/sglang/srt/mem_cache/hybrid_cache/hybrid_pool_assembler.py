@@ -287,6 +287,7 @@ def build_deepseek_v4_hicache_stack(
     pp_rank: int = 0,
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
+    use_host_hugepages: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     # TODO(hzh0425): Support PP for deepseek v4 with hicache
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
@@ -332,6 +333,7 @@ def build_deepseek_v4_hicache_stack(
         slot_page_size=kvcache.swa_page_size,
         layout=server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
+        use_host_hugepages=use_host_hugepages,
     )
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     entries = [
@@ -365,6 +367,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
+            use_host_hugepages=use_host_hugepages,
         )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
@@ -377,6 +380,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
+            use_host_hugepages=use_host_hugepages,
         )
         c4_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
@@ -388,6 +392,7 @@ def build_deepseek_v4_hicache_stack(
             swa_page_size=kvcache.swa_page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
+            use_host_hugepages=use_host_hugepages,
         )
         c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
@@ -399,6 +404,7 @@ def build_deepseek_v4_hicache_stack(
             swa_page_size=kvcache.swa_page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
+            use_host_hugepages=use_host_hugepages,
         )
         entries.extend(
             [
@@ -442,6 +448,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
+            use_host_hugepages=use_host_hugepages,
         )
         c128_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C128_STATE),
@@ -453,6 +460,7 @@ def build_deepseek_v4_hicache_stack(
             swa_page_size=kvcache.swa_page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
+            use_host_hugepages=use_host_hugepages,
         )
         entries.extend(
             [
@@ -658,6 +666,7 @@ def attach_hybrid_pool_to_unified_cache(
     params: CacheInitParams,
     server_args: ServerArgs,
     *,
+    extra_config: dict,
     load_cache_event,
     attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -708,6 +717,7 @@ def attach_hybrid_pool_to_unified_cache(
             }, "Non-hybrid KV pool currently only supports FULL-only UnifiedRadixCache."
 
         if deepseek_v4_stack:
+            use_host_hugepages = NixlBackendConfig(extra_config).use_host_hugepages()
             host_pool_group, cache_controller = build_deepseek_v4_hicache_stack(
                 params=params,
                 server_args=server_args,
@@ -724,6 +734,8 @@ def attach_hybrid_pool_to_unified_cache(
                 ),
                 pp_rank=params.pp_rank,
                 pp_size=params.pp_size,
+                storage_backend_extra_config=extra_config,
+                use_host_hugepages=use_host_hugepages,
             )
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group

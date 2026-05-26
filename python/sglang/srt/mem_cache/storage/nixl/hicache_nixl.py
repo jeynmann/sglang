@@ -146,7 +146,12 @@ class HiCacheNixl(HiCacheStorage):
             self._obj_reg_tuple = HiCacheNixl._obj_reg_tuple_default
 
     def _assert_doca_memos_host_hugepages(self, mem_pool_host: HostKVCache) -> None:
-        if self._require_host_hugepages and not mem_pool_host.use_host_hugepages:
+        if not self._require_host_hugepages:
+            return
+        # DeepSeek V4 LogicalHostPool has no host tensors (index-only anchor).
+        if getattr(mem_pool_host, "kv_buffer", None) is None:
+            return
+        if not mem_pool_host.use_host_hugepages:
             raise RuntimeError(
                 "HiCache NIXL DOCA_MEMOS requires hugetlb-backed host memory. "
                 "Enable use_host_hugepages in --hicache-storage-backend-extra-config "
