@@ -14,12 +14,9 @@ touched per transfer.
 import logging
 import threading
 from contextlib import contextmanager
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 from .nixl_utils import NixlFileManager
-
-# (key, size_bytes, dev_id) -> NIXL OBJ registration tuple
-ObjRegTupleFn = Callable[[str, int, int], tuple]
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +41,10 @@ class NixlRegistry:
         agent,
         mem_type: str,
         file_manager: Optional[NixlFileManager] = None,
-        obj_reg_tuple_fn: Optional[ObjRegTupleFn] = None,
     ):
         self.agent = agent
         self.mem_type = mem_type
         self.file_manager = file_manager
-        self._obj_reg_tuple_fn = obj_reg_tuple_fn
         # OBJ devIds key a process-wide map in the NIXL OBJ plugin
         # (devIdToObjKey_) that is not protected by a lock, so concurrent
         # OBJ registrations must use disjoint devId ranges. Allocate them
@@ -146,13 +141,7 @@ class NixlRegistry:
                 base = self._obj_devid_next
                 self._obj_devid_next += n
             dev_ids = list(range(base, base + n))
-            if self._obj_reg_tuple_fn is not None:
-                tuples = [
-                    self._obj_reg_tuple_fn(keys[i], sizes[i], dev_ids[i])
-                    for i in range(n)
-                ]
-            else:
-                tuples = [(0, sizes[i], dev_ids[i], keys[i]) for i in range(n)]
+            tuples = [(0, sizes[i], dev_ids[i], keys[i]) for i in range(n)]
             with self._registered(tuples, "OBJ") as reg:
                 if reg is None:
                     yield None

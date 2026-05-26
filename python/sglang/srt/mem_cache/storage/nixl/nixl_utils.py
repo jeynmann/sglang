@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any, Optional
+from typing import Optional
 
 from sglang.srt.environ import envs
 
@@ -78,16 +78,6 @@ class NixlBackendConfig:
 
         return initparams
 
-    @staticmethod
-    def is_truthy(value: Any) -> bool:
-        return value is True or (
-            isinstance(value, str) and value.lower() in ("true", "yes")
-        )
-
-    def use_host_hugepages(self) -> bool:
-        """Whether extra config sets ``use_host_hugepages``."""
-        return self.is_truthy(self.config.get("use_host_hugepages", False))
-
 
 class NixlBackendSelection:
     """Handles NIXL backend selection and creation."""
@@ -141,15 +131,20 @@ class NixlBackendSelection:
                 return False
 
             if self.backend_name == "DOCA_MEMOS":
-                from sglang.srt.mem_cache.storage.nixl.hugepage_util import HugepageUtil
+                from sglang.srt.mem_cache.mmap_allocator import (
+                    HUGEPAGE_BYTES_2MB,
+                    hugepage_available_bytes,
+                    hugepage_size_requested,
+                )
 
-                if (
-                    self.nixlconfig is None
-                    or not self.nixlconfig.use_host_hugepages()
-                    or not HugepageUtil.validate_meminfo()
+                hugepage_size = hugepage_size_requested()
+                if (hugepage_size != HUGEPAGE_BYTES_2MB) or (
+                    hugepage_available_bytes(hugepage_size) == 0
                 ):
                     logger.error(
-                        "NIXL DOCA_MEMOS requires use_host_hugepages=true and vm.nr_hugepages reserved."
+                        "NIXL DOCA_MEMOS requires SGLANG_HUGEPAGE_SIZE=2MB. "
+                        "Host KV must be hugetlb-backed (alloc_mmap falls back to "
+                        "normal pages if the pool is empty)."
                     )
                     return False
 

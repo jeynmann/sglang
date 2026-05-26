@@ -14,7 +14,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
-from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.mem_cache.mmap_allocator import (
+    MEM_BACKEND_HUGEPAGE,
+    alloc_mmap,
+    tensor_mem_backend,
+)
 
 from .nixl_registry import NixlRegistry
 from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager
@@ -28,60 +32,11 @@ except ImportError as e:
         "to use HiCacheNixl storage backend."
     ) from e
 
-try:
-    from nixl._api import nixl_thread_sync_t as _nixl_thread_sync_t
-
-    _NIXL_SYNC_MODE_SUPPORTED = True
-    _NIXL_SYNC_MODE_DEFAULT = _nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT
-except ImportError:
-    _nixl_thread_sync_t = None  # type: ignore[misc,assignment]
-    _NIXL_SYNC_MODE_SUPPORTED = False
-    _NIXL_SYNC_MODE_DEFAULT = None
-
 logger = logging.getLogger(__name__)
 
 
 class HiCacheNixl(HiCacheStorage):
     """HiCacheNixl provides high-performance storage using NIXL plugins."""
-
-    @staticmethod
-    def _parse_sync_mode(cfg: dict[str, Any]) -> Any:
-        sync_mode = _NIXL_SYNC_MODE_DEFAULT
-        sync_mode_str = cfg.get("nixl_sync_mode")
-        if sync_mode_str is None:
-            return sync_mode
-
-        if not _NIXL_SYNC_MODE_SUPPORTED:
-            raise ValueError(
-                "nixl_sync_mode is set in --hicache-storage-backend-extra-config but "
-                "this NIXL build does not support it (requires ai-dynamo/nixl#1501). "
-                "Remove nixl_sync_mode from config or upgrade NIXL."
-            )
-
-        attr_name = f"NIXL_THREAD_SYNC_{str(sync_mode_str).upper()}"
-        if not hasattr(_nixl_thread_sync_t, attr_name):
-            raise ValueError(
-                f"Invalid nixl_sync_mode '{sync_mode_str}'. "
-                "Use a suffix of NIXL_THREAD_SYNC_* from nixl_thread_sync_t."
-            )
-        return getattr(_nixl_thread_sync_t, attr_name)
-
-    @staticmethod
-    def _parse_agent_config(extra: Optional[dict]) -> Any:
-        """Build ``nixl_agent_config`` with optional ``nixl_enable_prog_thread`` / ``nixl_sync_mode``."""
-        cfg = extra or {}
-        kwargs: dict[str, Any] = {"backends": []}
-
-        enable_prog = NixlBackendConfig.is_truthy(
-            cfg.get("nixl_enable_prog_thread", True)
-        )
-        kwargs["enable_prog_thread"] = enable_prog
-
-        sync_mode = HiCacheNixl._parse_sync_mode(cfg)
-        if sync_mode is not None:
-            kwargs["sync_mode"] = sync_mode
-
-        return nixl_agent_config(**kwargs)
 
     def __init__(
         self,
@@ -124,12 +79,10 @@ class HiCacheNixl(HiCacheStorage):
         else:
             self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
 
-        agent_config = self._parse_agent_config(storage_config.extra_config)
-        sync_mode = getattr(agent_config, "sync_mode", None)
-        if sync_mode is None:
-            sync_mode = getattr(
-                nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT
-            )
+        sync_mode = getattr(
+            nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT
+        )
+        agent_config = nixl_agent_config(backends=[])
         self.agent_name = f"hicache_nixl_{str(uuid.uuid4())}"
         self.agent = nixl_agent(self.agent_name, agent_config)
         bind_cfg = nixlBind.nixlAgentConfig()
@@ -147,22 +100,21 @@ class HiCacheNixl(HiCacheStorage):
         if not self.backend_selector.create_backend(self.agent):
             raise RuntimeError("Failed to create NIXL backend")
 
-        self._require_host_hugepages = (
-            self.backend_selector.backend_name == "DOCA_MEMOS"
-        )
         if self.backend_selector.backend_name == "DOCA_MEMOS":
-            self._format_key = HiCacheNixl._format_key_doca_memos
-            obj_reg_tuple_fn = HiCacheNixl._obj_reg_tuple_doca_memos
+            self._format_key = self._format_key_doca_memos
+        elif self.backend_selector.mem_type == "FILE":
+            self._format_key = self._format_key_file
         else:
-            self._format_key = HiCacheNixl._format_key_default
-            obj_reg_tuple_fn = None
+            self._format_key = self._format_key_obj
 
         self.registry = NixlRegistry(
             self.agent,
             self.backend_selector.mem_type,
             self.file_manager,
-            obj_reg_tuple_fn=obj_reg_tuple_fn,
         )
+        # O_DIRECT requires OS-page-aligned I/O buffers on all file-based backends
+        # (POSIX, GDS, GDS_MT, 3FS). OBJ backends never open files so they are exempt
+        # (file_manager is None for OBJ).
         self.needs_page_alignment = use_direct_io and self.file_manager is not None
         if self.needs_page_alignment:
             logger.info(
@@ -170,52 +122,29 @@ class HiCacheNixl(HiCacheStorage):
                 "Page-aligned host buffers are required (needs_page_alignment=True).",
                 self.backend_selector.backend_name,
             )
+        # Pre-registered host regions (set by register_mem_pool_host):
+        # zero-copy: one registration covering mem_pool_host.kv_buffer
+        # non-zero-copy: two registrations, one bounce buffer per direction
+        # (set/get) so the two storage threads never share slots.
         self._host_regs: List[Any] = []
         self._bounce_set: Optional[torch.Tensor] = None
         self._bounce_get: Optional[torch.Tensor] = None
         self._bounce_page_bytes: Optional[int] = None
 
-    def _assert_doca_memos_host_hugepages(self, mem_pool_host: HostKVCache) -> None:
-        if not self._require_host_hugepages:
-            return
-        if getattr(mem_pool_host, "kv_buffer", None) is None:
-            return
-        if not mem_pool_host.use_host_hugepages:
-            raise RuntimeError(
-                "HiCache NIXL DOCA_MEMOS requires hugetlb-backed host memory. "
-                "Enable use_host_hugepages in --hicache-storage-backend-extra-config "
-                "and reserve Linux huge pages (vm.nr_hugepages)."
-            )
-
-    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
-        super().register_mem_host_pool_v2(host_pool, host_pool_name)
-        self._assert_doca_memos_host_hugepages(host_pool)
-
-    @staticmethod
-    def _format_key_default(key: str) -> str:
+    def _format_key_obj(self, key: str) -> str:
         return key
 
-    @staticmethod
-    def _format_key_doca_memos(key: str) -> str:
-        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    def _format_key_file(self, key: str) -> str:
+        return self.file_manager.get_file_path(key)
 
-    @staticmethod
-    def _obj_reg_tuple_doca_memos(key: str, size: int, _dev_id: int = 0) -> tuple:
-        key_hash = hashlib.sha256(key.encode("utf-8"))
-        return (
-            0,
-            size,
-            int.from_bytes(key_hash.digest()[:8], "big"),
-            key_hash.hexdigest()[:32],
-        )
+    def _format_key_doca_memos(self, key: str) -> str:
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
     def _create_query_tuple(self, key: str) -> tuple:
         """Build the NIXL query_memory tuple for a single key."""
-        if self.backend_selector.mem_type == "FILE":
-            return (0, 0, 0, self.file_manager.get_file_path(key))
         return (0, 0, 0, self._format_key(key))
 
     # ------------------------------------------------------------------
@@ -278,14 +207,7 @@ class HiCacheNixl(HiCacheStorage):
             logger.error("Failed to build host xfer descs")
             return False
 
-        storage_keys = (
-            [self._format_key(k) for k in keys]
-            if self.backend_selector.mem_type == "OBJ"
-            else keys
-        )
-        with self.registry.storage(
-            host_buffers, storage_keys, direction
-        ) as storage_descs:
+        with self.registry.storage(host_buffers, keys, direction) as storage_descs:
             if storage_descs is None:
                 return False
             return self._xfer_and_wait(host_descs, storage_descs, direction)
@@ -332,7 +254,6 @@ class HiCacheNixl(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
-        self._assert_doca_memos_host_hugepages(mem_pool_host)
 
         # enable zero-copy automatically if mem layout is page_first or page_first_direct
         self.is_zero_copy = self.mem_pool_host.layout in [
@@ -340,13 +261,18 @@ class HiCacheNixl(HiCacheStorage):
             "page_first_direct",
         ]
 
-        if self._require_host_hugepages and not self.is_zero_copy:
-            raise RuntimeError(
-                "HiCache NIXL DOCA_MEMOS requires page_first or page_first_direct "
-                "host layout for L3 zero-copy I/O (got "
-                f"{self.mem_pool_host.layout!r}). Set --hicache-mem-layout page_first "
-                "or page_first_direct."
-            )
+        if self.backend_selector.backend_name == "DOCA_MEMOS":
+            if not self.is_zero_copy:
+                raise RuntimeError(
+                    "HiCache NIXL DOCA_MEMOS requires --hicache-mem-layout "
+                    "page_first or page_first_direct."
+                )
+            if tensor_mem_backend(mem_pool_host.kv_buffer) != MEM_BACKEND_HUGEPAGE:
+                raise RuntimeError(
+                    "HiCache NIXL DOCA_MEMOS requires hugetlb-backed host KV memory. "
+                    "Set SGLANG_HUGEPAGE_SIZE=2MB and reserve 2 MiB huge pages so "
+                    "alloc_mmap does not fall back to normal pages."
+                )
 
         if self.needs_page_alignment and self.is_zero_copy:
             # Check that the kv_buffer base AND per-page strides are multiples of

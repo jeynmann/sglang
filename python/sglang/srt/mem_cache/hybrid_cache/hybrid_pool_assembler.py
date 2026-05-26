@@ -18,7 +18,6 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
     PoolEntry,
 )
-from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlBackendConfig
 
 if TYPE_CHECKING:
     import torch
@@ -51,7 +50,6 @@ def build_kv_host_pool(
     server_args: ServerArgs,
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
-    use_host_hugepages: bool = False,
 ):
     kv_host_pool_cls = MLATokenToKVPoolHost if use_mla else MHATokenToKVPoolHost
     kwargs = {}
@@ -64,7 +62,6 @@ def build_kv_host_pool(
         page_size,
         server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
-        use_host_hugepages=use_host_hugepages,
         **kwargs,
     )
 
@@ -115,7 +112,6 @@ def build_kv_only_stack(
     pp_rank: int = 0,
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
-    use_host_hugepages: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -124,7 +120,6 @@ def build_kv_only_stack(
         server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
-        use_host_hugepages=use_host_hugepages,
     )
     entries = [
         build_pool_entry(
@@ -287,7 +282,6 @@ def build_deepseek_v4_hicache_stack(
     pp_rank: int = 0,
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
-    use_host_hugepages: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     # TODO(hzh0425): Support PP for deepseek v4 with hicache
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
@@ -333,7 +327,6 @@ def build_deepseek_v4_hicache_stack(
         slot_page_size=kvcache.swa_page_size,
         layout=server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
-        use_host_hugepages=use_host_hugepages,
     )
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     entries = [
@@ -367,7 +360,6 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
-            use_host_hugepages=use_host_hugepages,
         )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
@@ -380,7 +372,6 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
-            use_host_hugepages=use_host_hugepages,
         )
         c4_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
@@ -392,7 +383,6 @@ def build_deepseek_v4_hicache_stack(
             swa_page_size=kvcache.swa_page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
-            use_host_hugepages=use_host_hugepages,
         )
         c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
@@ -404,7 +394,6 @@ def build_deepseek_v4_hicache_stack(
             swa_page_size=kvcache.swa_page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
-            use_host_hugepages=use_host_hugepages,
         )
         entries.extend(
             [
@@ -448,7 +437,6 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
-            use_host_hugepages=use_host_hugepages,
         )
         c128_state_host_pool = DeepSeekV4StateHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C128_STATE),
@@ -460,7 +448,6 @@ def build_deepseek_v4_hicache_stack(
             swa_page_size=kvcache.swa_page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
-            use_host_hugepages=use_host_hugepages,
         )
         entries.extend(
             [
@@ -527,7 +514,6 @@ def build_hybrid_mamba_stack(
     pp_rank: int = 0,
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
-    use_host_hugepages: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -535,7 +521,6 @@ def build_hybrid_mamba_stack(
         page_size=page_size,
         server_args=server_args,
         use_mla=use_mla,
-        use_host_hugepages=use_host_hugepages,
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
@@ -543,7 +528,6 @@ def build_hybrid_mamba_stack(
         server_args.hicache_size,
         allocator_type=server_args.hicache_storage_backend,
         layout=server_args.hicache_mem_layout,
-        use_host_hugepages=use_host_hugepages,
     )
     entries = [
         build_pool_entry(
@@ -609,7 +593,6 @@ def build_anchor_sidecar_stack(
     pp_rank: int = 0,
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
-    use_host_hugepages: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -618,7 +601,6 @@ def build_anchor_sidecar_stack(
         server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
-        use_host_hugepages=use_host_hugepages,
     )
     sidecar_host_pool = sidecar_host_pool_factory(kv_host_pool)
     entries = [
@@ -666,7 +648,6 @@ def attach_hybrid_pool_to_unified_cache(
     params: CacheInitParams,
     server_args: ServerArgs,
     *,
-    extra_config: dict,
     load_cache_event,
     attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -717,7 +698,6 @@ def attach_hybrid_pool_to_unified_cache(
             }, "Non-hybrid KV pool currently only supports FULL-only UnifiedRadixCache."
 
         if deepseek_v4_stack:
-            use_host_hugepages = NixlBackendConfig(extra_config).use_host_hugepages()
             host_pool_group, cache_controller = build_deepseek_v4_hicache_stack(
                 params=params,
                 server_args=server_args,
@@ -734,8 +714,6 @@ def attach_hybrid_pool_to_unified_cache(
                 ),
                 pp_rank=params.pp_rank,
                 pp_size=params.pp_size,
-                storage_backend_extra_config=extra_config,
-                use_host_hugepages=use_host_hugepages,
             )
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
@@ -952,7 +930,6 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     try:
         kv = radix_cache.kv_cache
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
-        use_host_hugepages = NixlBackendConfig(extra_config).use_host_hugepages()
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             server_args=server_args,
@@ -968,19 +945,17 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             use_mla=True,
             override_kv_cache_dim=kv.kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
-            sidecar_host_pool_factory=lambda kv_host_pool, uhp=use_host_hugepages: DSAIndexerPoolHost(
+            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
                 kv,
                 kv_host_pool,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
-                use_host_hugepages=uhp,
             ),
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,
             pp_rank=radix_cache.pp_rank,
             pp_size=radix_cache.pp_size,
             enable_storage_metrics=enable_storage_metrics,
-            use_host_hugepages=use_host_hugepages,
         )
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group
@@ -1016,7 +991,6 @@ def attach_hybrid_pool_to_mamba_cache(
         kvcache = mamba_cache.kvcache
         full_layer_mapping = dict(hybrid_kv.full_attention_layer_id_mapping)
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
-        use_host_hugepages = NixlBackendConfig(extra_config).use_host_hugepages()
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
             params=params,
             server_args=server_args,
@@ -1039,7 +1013,6 @@ def attach_hybrid_pool_to_mamba_cache(
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
             enable_storage_metrics=enable_storage_metrics,
-            use_host_hugepages=use_host_hugepages,
         )
         mamba_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         mamba_cache.mamba_pool_host = host_pool_group.get_pool(PoolName.MAMBA)

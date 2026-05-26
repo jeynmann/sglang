@@ -9,14 +9,9 @@
 # nixl_enable_prog_thread = true
 # Thread synchronization mode. Default: None
 # nixl_sync_mode = "strict"
-# HiCache: request hugetlb-backed host KV (use_host_hugepages). Only NIXL + DOCA_MEMOS
-# implements this today. Default: false
-# use_host_hugepages = true
+# HiCache host KV hugepages: set env SGLANG_HUGEPAGE_SIZE=2MB.
+# Required for NIXL DOCA_MEMOS; reserve vm.nr_hugepages on the host.
 # DOCA_MEMOS L3 I/O requires --hicache-mem-layout page_first or page_first_direct.
-
-# Max KV pages per HiCache backup/prefetch NIXL transfer (default: 128).
-# For DOCA_MEMOS, set <= the DOCA task pool / num_tasks (e.g. 32 or 64).
-# storage_batch_size = 32
 
 ########################################
 # POSIX FILE SYSTEM BACKEND

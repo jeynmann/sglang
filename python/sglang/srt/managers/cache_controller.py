@@ -347,17 +347,6 @@ class HiCacheController:
             )
         return 0, 1
 
-    @staticmethod
-    def _parse_storage_batch_size(extra_config: dict) -> int:
-        batch_size = int(extra_config.get("storage_batch_size", "128"))
-        if batch_size < 1:
-            raise ValueError(f"storage_batch_size must be >= 1, got {batch_size!r}")
-        logger.info(
-            "HiCache storage_batch_size=%s (pages per L3 backup/prefetch batch)",
-            batch_size,
-        )
-        return batch_size
-
     def _create_prefetch_sync_groups(self) -> None:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
@@ -496,9 +485,6 @@ class HiCacheController:
         self.get_hash_str = get_hash_str
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
-        )
-        self.storage_batch_size = HiCacheController._parse_storage_batch_size(
-            self.storage_config.extra_config
         )
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (

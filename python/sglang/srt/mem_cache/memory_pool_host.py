@@ -12,7 +12,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
 
 import numpy as np
-import psutil
 import torch
 
 from sglang.jit_kernel.hicache import (
@@ -37,7 +36,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
 )
-from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.mem_cache.mmap_allocator import alloc_mmap, memory_available_bytes
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -79,18 +78,11 @@ def synchronized(func):
     return wrapper
 
 
-def _require_hugepages(num_bytes: int, label: str) -> None:
-    from sglang.srt.mem_cache.storage.nixl.hugepage_util import HugepageUtil
-
-    HugepageUtil.require_free_bytes(num_bytes, label=label)
-
-
 class HostTensorAllocator:
-    def __init__(self, use_host_hugepages: bool = False):
+    def __init__(self):
         """Initialize the HostTensorAllocator."""
         self.dtype = None
         self.dims = None
-        self._use_host_hugepages = use_host_hugepages
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
         assert (
@@ -98,18 +90,7 @@ class HostTensorAllocator:
         ), f"HostTensorAllocator only supports CPU allocations; got device={device!r}"
         self.dtype = dtype
         self.dims = dims
-        if self._use_host_hugepages:
-            from sglang.srt.environ import envs
-
-            huge = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip()
-            if not huge:
-                with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
-                    return alloc_mmap(dims, dtype)
         return alloc_mmap(dims, dtype)
-
-    @property
-    def use_host_hugepages(self) -> bool:
-        return self._use_host_hugepages
 
 
 class HiSparseHostPoolMixin:
@@ -175,7 +156,7 @@ class HiSparseHostPoolMixin:
         return host_indices[host_indices >= 0]
 
 
-def get_allocator_from_storage(allocator_type, use_host_hugepages: bool = False):
+def get_allocator_from_storage(allocator_type):
     if allocator_type == "mooncake":
         try:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -190,9 +171,8 @@ def get_allocator_from_storage(allocator_type, use_host_hugepages: bool = False)
                 "Fallback to use default allocator."
             )
             return HostTensorAllocator()
-    if allocator_type == "nixl":
-        return HostTensorAllocator(use_host_hugepages=use_host_hugepages)
-    return HostTensorAllocator()
+    else:
+        return HostTensorAllocator()
 
 
 def alloc_with_host_register(
@@ -256,16 +236,13 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
-        use_host_hugepages: bool = False,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(
-            allocator_type, use_host_hugepages=use_host_hugepages
-        )
+        self.allocator = get_allocator_from_storage(allocator_type)
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -283,33 +260,26 @@ class HostKVCache(abc.ABC):
             self.size > device_pool.size
         ), "The host memory should be larger than the device memory with the current protocol"
 
+        # Verify there is enough available host memory.
         requested_bytes = self.size * self.size_per_token
-        if self.use_host_hugepages:
-            _require_hugepages(requested_bytes, label="HiCache host KV pool: ")
+        available_bytes = memory_available_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory available. Requesting "
+                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                f"size of the hierarchical cache."
+            )
         else:
-            host_mem = psutil.virtual_memory()
-            available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-            if requested_bytes > available_bytes:
-                raise ValueError(
-                    f"Not enough host memory available. Requesting "
-                    f"{requested_bytes / 1e9:.2f} GB but only have "
-                    f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                    f"size of the hierarchical cache."
-                )
-        hp = " using hugepages" if self.use_host_hugepages else ""
-        logger.info(
-            f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache{hp}."
-        )
+            logger.info(
+                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+            )
 
         self.kv_buffer = self.init_kv_buffer()
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
-
-    @property
-    def use_host_hugepages(self) -> bool:
-        return self.allocator.use_host_hugepages
 
     @abc.abstractmethod
     def get_size_per_token(self):
@@ -415,7 +385,6 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
-        use_host_hugepages: bool = False,
     ):
         super().__init__(
             device_pool,
@@ -426,7 +395,6 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
-            use_host_hugepages,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
@@ -939,7 +907,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
-        use_host_hugepages: bool = False,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -951,7 +918,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pin_memory,
             device,
             allocator_type,
-            use_host_hugepages,
         )
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
@@ -1358,7 +1324,6 @@ class MambaPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         layout: str = "layer_first",
-        use_host_hugepages: bool = False,
     ):
         self.device_pool = device_pool
         self.page_size = 1
@@ -1371,9 +1336,7 @@ class MambaPoolHost(HostKVCache):
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(
-            allocator_type, use_host_hugepages=use_host_hugepages
-        )
+        self.allocator = get_allocator_from_storage(allocator_type)
         self.num_mamba_layers = device_pool.num_mamba_layers
 
         self.conv_state_shapes = [
@@ -1402,24 +1365,18 @@ class MambaPoolHost(HostKVCache):
         ), "The host memory should be larger than the device memory with the current protocol"
 
         requested_bytes = self.size * self.size_per_token
-        if self.use_host_hugepages:
-            _require_hugepages(requested_bytes, label="HiCache Mamba host pool: ")
-        else:
-            host_mem = psutil.virtual_memory()
-            available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-            if requested_bytes > available_bytes:
-                raise ValueError(
-                    f"Not enough host memory available. Requesting "
-                    f"{requested_bytes / 1e9:.2f} GB but only have "
-                    f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                    f"size of the hierarchical cache."
-                )
-        hp = " using hugepages" if self.use_host_hugepages else ""
+        available_bytes = memory_available_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory available. Requesting "
+                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                f"size of the hierarchical cache."
+            )
         logger.info(
-            "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s)%s.",
+            "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
             requested_bytes / 1e9,
             self.layout,
-            hp,
         )
 
         self.init_kv_buffer()
@@ -1928,7 +1885,6 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
-        use_host_hugepages: bool = False,
     ):
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
@@ -1938,9 +1894,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         self.dtype = torch.uint8
         self.device = device
         self.pin_memory = pin_memory
-        self.allocator = get_allocator_from_storage(
-            allocator_type, use_host_hugepages=use_host_hugepages
-        )
+        self.allocator = get_allocator_from_storage(allocator_type)
         self.page_size = slot_page_size
         self.size = num_host_pages * slot_page_size
         self.layout = layout
@@ -1953,19 +1907,13 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         self.gpu_device = device_buffers[0].device if device_buffers else device
 
         requested_bytes = self.layer_num * num_host_pages * self.item_bytes
-        if self.use_host_hugepages:
-            _require_hugepages(
-                requested_bytes, label=f"HiCache V4 paged pool '{pool_name}': "
+        available_bytes = memory_available_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory for V4 paged pool {pool_name}. "
+                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free."
             )
-        else:
-            host_mem = psutil.virtual_memory()
-            available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-            if requested_bytes > available_bytes:
-                raise ValueError(
-                    f"Not enough host memory for V4 paged pool {pool_name}. "
-                    f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                    f"{available_bytes / 1e9:.2f} GB free."
-                )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
         self.data_refs = []
@@ -2000,17 +1948,15 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-        hp = " using hugepages" if self.use_host_hugepages else ""
         logger.info(
             "Allocating %.2f GB host memory for V4 paged pool '%s' "
-            "(layers=%d, pages=%d, item_bytes=%d, layout=%s)%s.",
+            "(layers=%d, pages=%d, item_bytes=%d, layout=%s).",
             requested_bytes / 1e9,
             self.pool_name,
             self.layer_num,
             num_host_pages,
             self.item_bytes,
             self.layout,
-            hp,
         )
 
         self.device_ptrs = torch.tensor(
@@ -2240,7 +2186,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
-        use_host_hugepages: bool = False,
     ):
         if any(pool is None for pool in state_pools):
             raise ValueError(f"{pool_name} state_pools must not contain None")
@@ -2253,9 +2198,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.dtype = torch.uint8
         self.device = device
         self.pin_memory = pin_memory
-        self.allocator = get_allocator_from_storage(
-            allocator_type, use_host_hugepages=use_host_hugepages
-        )
+        self.allocator = get_allocator_from_storage(allocator_type)
         self.page_size = swa_page_size
         self.size = num_host_pages * swa_page_size
         self.layout = layout
@@ -2271,19 +2214,13 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.size_per_token = self.state_page_bytes
 
         requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
-        if self.use_host_hugepages:
-            _require_hugepages(
-                requested_bytes, label=f"HiCache V4 state pool '{pool_name}': "
+        available_bytes = memory_available_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory for V4 state pool {pool_name}. "
+                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free."
             )
-        else:
-            host_mem = psutil.virtual_memory()
-            available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-            if requested_bytes > available_bytes:
-                raise ValueError(
-                    f"Not enough host memory for V4 state pool {pool_name}. "
-                    f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                    f"{available_bytes / 1e9:.2f} GB free."
-                )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
         self.data_refs = []
@@ -2317,17 +2254,15 @@ class DeepSeekV4StateHostPool(HostKVCache):
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
-        hp = " using hugepages" if self.use_host_hugepages else ""
         logger.info(
             "Allocating %.2f GB host memory for V4 state pool '%s' "
-            "(layers=%d, pages=%d, state_page_bytes=%d, layout=%s)%s.",
+            "(layers=%d, pages=%d, state_page_bytes=%d, layout=%s).",
             requested_bytes / 1e9,
             self.pool_name,
             self.layer_num,
             num_host_pages,
             self.state_page_bytes,
             self.layout,
-            hp,
         )
         self.device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.device_page_views],
@@ -2615,13 +2550,6 @@ class HostPoolGroup:
         self.size = self.anchor_entry.host_pool.size
 
     @property
-    def use_host_hugepages(self) -> bool:
-        for entry in self.entries:
-            if getattr(entry.host_pool, "use_host_hugepages", False):
-                return True
-        return False
-
-    @property
     def kv_buffer(self):
         return self.anchor_entry.host_pool.kv_buffer
 
@@ -2754,16 +2682,13 @@ class DSAIndexerPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
-        use_host_hugepages: bool = False,
     ):
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(
-            allocator_type, use_host_hugepages=use_host_hugepages
-        )
+        self.allocator = get_allocator_from_storage(allocator_type)
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
@@ -2790,23 +2715,17 @@ class DSAIndexerPoolHost(HostKVCache):
 
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
-        if self.use_host_hugepages:
-            _require_hugepages(requested_bytes, label="HiCache DSA indexer host pool: ")
-        else:
-            host_mem = psutil.virtual_memory()
-            available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-            if requested_bytes > available_bytes:
-                raise ValueError(
-                    f"Not enough host memory for DSA indexer hierarchical cache. "
-                    f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                    f"{available_bytes / 1e9:.2f} GB free."
-                )
-        hp = " using hugepages" if self.use_host_hugepages else ""
+        available_bytes = memory_available_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory for DSA indexer hierarchical cache. "
+                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free."
+            )
         logger.info(
-            "Allocating %.2f GB host memory for DSA indexer (layout=%s)%s.",
+            "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
             requested_bytes / 1e9,
             layout,
-            hp,
         )
         self.init_kv_buffer()
         self.lock = threading.RLock()

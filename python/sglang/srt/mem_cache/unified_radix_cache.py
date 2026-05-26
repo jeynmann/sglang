@@ -303,11 +303,6 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             attach_hybrid_pool_to_unified_cache,
-            load_hicache_storage_extra_config,
-        )
-
-        extra_config = load_hicache_storage_extra_config(
-            server_args.hicache_storage_backend_extra_config
         )
 
         # Direct IO layout fixup (must happen before pool creation)
@@ -325,7 +320,6 @@ class UnifiedRadixCache(BasePrefixCache):
             self,
             params,
             server_args,
-            extra_config=extra_config,
             load_cache_event=self.load_cache_event,
             attn_cp_group=params.attn_cp_cache_group,
             attn_tp_group=params.attn_tp_cache_group,
