@@ -692,6 +692,31 @@ class TestNixlUnified(CustomTestCase):
         self.assertTrue(torch.equal(mamba_pool.get_data_page(0), expected_mamba))
         self.assertTrue(torch.equal(swa_pool.get_data_page(0), expected_swa))
 
+    def test_mha_host_pool_exposes_all_v2_registration_buffers(self):
+        """SWA registration sees the backing tensor(s) for both MHA layouts."""
+        from sglang.srt.mem_cache.pool_host.mha import (
+            AsymmetricMHATokenToKVPoolHost,
+            MHATokenToKVPoolHost,
+        )
+
+        shared_kv = torch.zeros(2, 4)
+        symmetric = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        symmetric.kv_buffer = shared_kv
+        symmetric_buffers = symmetric.get_hybrid_pool_buffer()
+        self.assertEqual(len(symmetric_buffers), 1)
+        self.assertIs(symmetric_buffers[0], shared_kv)
+
+        k_buffer = torch.zeros(4)
+        v_buffer = torch.zeros(8)
+        asymmetric = AsymmetricMHATokenToKVPoolHost.__new__(
+            AsymmetricMHATokenToKVPoolHost
+        )
+        asymmetric.kv_buffer = (k_buffer, v_buffer)
+        asymmetric_buffers = asymmetric.get_hybrid_pool_buffer()
+        self.assertEqual(len(asymmetric_buffers), 2)
+        self.assertIs(asymmetric_buffers[0], k_buffer)
+        self.assertIs(asymmetric_buffers[1], v_buffer)
+
 
 @unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT not available on this platform")
 class TestNixlDirectIO(CustomTestCase):
