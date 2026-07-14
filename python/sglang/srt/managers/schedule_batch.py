@@ -148,6 +148,65 @@ def _compute_pad_value(hash: int) -> int:
     return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
 
 
+def compute_logical_host_hit_span(
+    prefix_len: int,
+    host_hit_length: int,
+    swa_host_hit_length: int,
+    mamba_host_hit_length: int,
+    mamba_branching_seqlen: Optional[int],
+    storage_hit_length: int,
+) -> int:
+    """Return the overlapping logical prefix span served through host.
+
+    Hybrid component ranges overlap, so their hit lengths must be combined with
+    ``max`` rather than ``sum``. Mamba's host-hit field is a slot sentinel; its
+    branching sequence length is the token span and is valid only on a host hit.
+    Storage hits also traverse host and therefore contribute to this span.
+    """
+    prefix_len = max(0, prefix_len)
+    mamba_span = max(0, mamba_branching_seqlen or 0) if mamba_host_hit_length > 0 else 0
+    logical_host_span = max(
+        0,
+        host_hit_length,
+        swa_host_hit_length,
+        mamba_span,
+        storage_hit_length,
+    )
+    return min(prefix_len, logical_host_span)
+
+
+def compute_cache_hit_split(
+    prefix_len: int, logical_host_span: int, storage_hit_length: int
+) -> tuple[int, int, int]:
+    """Return mutually exclusive device, host, and storage cached-token counts."""
+    prefix_len = max(0, prefix_len)
+    host_total = min(prefix_len, max(0, logical_host_span))
+    storage = min(host_total, max(0, storage_hit_length))
+    return prefix_len - host_total, host_total - storage, storage
+
+
+def compute_num_matched_prefix_tokens(
+    device_prefix_len: int,
+    max_prefix_len: int,
+    host_hit_length: int,
+    swa_host_hit_length: int,
+    mamba_host_hit_length: int,
+    mamba_branching_seqlen: Optional[int],
+    storage_hit_length: int,
+) -> int:
+    """Combine device hits with the overlapping logical hybrid host span."""
+    max_prefix_len = max(0, max_prefix_len)
+    logical_host_span = compute_logical_host_hit_span(
+        max_prefix_len,
+        host_hit_length,
+        swa_host_hit_length,
+        mamba_host_hit_length,
+        mamba_branching_seqlen,
+        storage_hit_length,
+    )
+    return min(max_prefix_len, max(0, device_prefix_len) + logical_host_span)
+
+
 class BaseFinishReason:
     def to_json(self):
         raise NotImplementedError()
@@ -1271,6 +1330,15 @@ class Req(ReqDllmMixin):
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            self.num_matched_prefix_tokens = compute_num_matched_prefix_tokens(
+                len(self.prefix_indices),
+                self._compute_max_prefix_len(input_len),
+                self.host_hit_length,
+                self.swa_host_hit_length,
+                self.mamba_host_hit_length,
+                self.mamba_branching_seqlen,
+                self.storage_hit_length,
+            )
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
             else:
@@ -1520,6 +1588,10 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
+        self.host_hit_length = 0
+        self.swa_host_hit_length = 0
+        self.mamba_host_hit_length = 0
+        self.storage_hit_length = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_range = None
@@ -2290,24 +2362,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
                 # would incorrectly count previously computed tokens as cache hits.
                 if not req._cache_breakdown_computed:
-                    # At this point, prefix_indices has been extended with host data
-                    # via init_load_back in schedule_policy, so:
-                    # - len(prefix_indices) = device_original + host_loaded
-                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
-                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
-                    #
-                    # Storage hits are now tracked via scheduler after prefetch completes.
-                    # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    host_total = req.host_hit_length
-                    # Clamp storage to host_total to handle edge cases
-                    storage_portion = min(host_total, req.storage_hit_length)
-                    host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
-
-                    req.cached_tokens_device = device_portion
-                    req.cached_tokens_host = host_portion
-                    req.cached_tokens_storage = storage_portion
+                    logical_host_span = compute_logical_host_hit_span(
+                        pre_len,
+                        req.host_hit_length,
+                        req.swa_host_hit_length,
+                        req.mamba_host_hit_length,
+                        req.mamba_branching_seqlen,
+                        req.storage_hit_length,
+                    )
+                    (
+                        req.cached_tokens_device,
+                        req.cached_tokens_host,
+                        req.cached_tokens_storage,
+                    ) = compute_cache_hit_split(
+                        pre_len,
+                        logical_host_span,
+                        req.storage_hit_length,
+                    )
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len

@@ -2,7 +2,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    compute_cache_hit_split,
+    compute_logical_host_hit_span,
+    compute_num_matched_prefix_tokens,
+)
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
@@ -34,6 +39,106 @@ class _RecordingDelayer:
     def negotiate_should_allow_prefill(self, local_prefillable, **kwargs):
         self.calls.append(local_prefillable)
         return self.allow
+
+
+class TestCacheHitSplit(unittest.TestCase):
+    @staticmethod
+    def split(
+        prefix_len,
+        host_hit_length=0,
+        swa_host_hit_length=0,
+        mamba_host_hit_length=0,
+        mamba_branching_seqlen=None,
+        storage_hit_length=0,
+    ):
+        logical_host_span = compute_logical_host_hit_span(
+            prefix_len,
+            host_hit_length,
+            swa_host_hit_length,
+            mamba_host_hit_length,
+            mamba_branching_seqlen,
+            storage_hit_length,
+        )
+        return compute_cache_hit_split(
+            prefix_len, logical_host_span, storage_hit_length
+        )
+
+    def test_plain_mha_host_span(self):
+        self.assertEqual(
+            self.split(100, host_hit_length=40),
+            (60, 40, 0),
+        )
+
+    def test_swa_overlap_uses_max_not_sum(self):
+        self.assertEqual(
+            self.split(100, host_hit_length=40, swa_host_hit_length=60),
+            (40, 60, 0),
+        )
+
+    def test_mamba_uses_branching_sequence_span(self):
+        self.assertEqual(
+            self.split(
+                100,
+                mamba_host_hit_length=1,
+                mamba_branching_seqlen=70,
+            ),
+            (30, 70, 0),
+        )
+
+    def test_storage_counts_without_base_host_load(self):
+        self.assertEqual(
+            self.split(100, storage_hit_length=30),
+            (70, 0, 30),
+        )
+
+    def test_lengths_are_clamped(self):
+        self.assertEqual(
+            self.split(100, host_hit_length=120, storage_hit_length=150),
+            (0, 0, 100),
+        )
+        self.assertEqual(self.split(-1, host_hit_length=10), (0, 0, 0))
+
+    def test_split_preserves_prefix_total(self):
+        cases = (
+            (100, 40, 20),
+            (100, 0, 30),
+            (100, 120, 150),
+            (7, 3, -1),
+        )
+        for prefix_len, logical_host_span, storage_hit_length in cases:
+            split = compute_cache_hit_split(
+                prefix_len, logical_host_span, storage_hit_length
+            )
+            self.assertEqual(sum(split), max(0, prefix_len))
+            self.assertTrue(all(value >= 0 for value in split))
+
+    def test_swa_logical_span_updates_matched_prefix(self):
+        self.assertEqual(
+            compute_num_matched_prefix_tokens(
+                device_prefix_len=20,
+                max_prefix_len=100,
+                host_hit_length=10,
+                swa_host_hit_length=40,
+                mamba_host_hit_length=0,
+                mamba_branching_seqlen=None,
+                storage_hit_length=0,
+            ),
+            60,
+        )
+
+    def test_mamba_logical_span_updates_matched_prefix(self):
+        self.assertEqual(
+            compute_num_matched_prefix_tokens(
+                device_prefix_len=20,
+                max_prefix_len=100,
+                host_hit_length=0,
+                swa_host_hit_length=0,
+                mamba_host_hit_length=1,
+                mamba_branching_seqlen=50,
+                storage_hit_length=0,
+            ),
+            70,
+        )
 
 
 class TestPrefillAdder(CustomTestCase):
