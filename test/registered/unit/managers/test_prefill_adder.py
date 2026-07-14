@@ -141,6 +141,81 @@ class TestCacheHitSplit(unittest.TestCase):
         )
 
 
+class TestPrefillTierMetrics(unittest.TestCase):
+    def test_prefill_adder_accumulates_corrected_split(self):
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.log_hit_tokens_device = 0
+        adder.log_hit_tokens_host = 0
+        adder.log_hit_tokens_storage = 0
+        req = SimpleNamespace(
+            host_hit_length=40,
+            swa_host_hit_length=60,
+            mamba_host_hit_length=0,
+            mamba_branching_seqlen=None,
+            storage_hit_length=30,
+            retracted_stain=False,
+        )
+
+        adder._accumulate_hit_token_split(req, 100)
+        adder._accumulate_hit_token_split(req, 0)
+
+        self.assertEqual(
+            (
+                adder.log_hit_tokens_device,
+                adder.log_hit_tokens_host,
+                adder.log_hit_tokens_storage,
+            ),
+            (40, 30, 30),
+        )
+
+    def test_retracted_readmission_does_not_recount_tier_hits(self):
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.log_hit_tokens_device = 7
+        adder.log_hit_tokens_host = 5
+        adder.log_hit_tokens_storage = 3
+        req = SimpleNamespace(
+            host_hit_length=40,
+            swa_host_hit_length=60,
+            mamba_host_hit_length=0,
+            mamba_branching_seqlen=None,
+            storage_hit_length=30,
+            retracted_stain=True,
+        )
+
+        adder._accumulate_hit_token_split(req, 100)
+
+        self.assertEqual(
+            (
+                adder.log_hit_tokens_device,
+                adder.log_hit_tokens_host,
+                adder.log_hit_tokens_storage,
+            ),
+            (7, 5, 3),
+        )
+
+    def test_prefill_stats_carries_tier_counters(self):
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            PrefillStats,
+        )
+
+        adder = SimpleNamespace(
+            log_input_tokens=20,
+            log_hit_tokens=100,
+            reprocessed_log_input_tokens=0,
+            reprocessed_log_hit_tokens=0,
+            log_hit_tokens_device=40,
+            log_hit_tokens_host=30,
+            log_hit_tokens_storage=30,
+            new_token_ratio=0.5,
+            can_run_list=[],
+        )
+        stats = PrefillStats.from_adder(adder, [])
+
+        self.assertEqual(stats.log_hit_tokens_device, 40)
+        self.assertEqual(stats.log_hit_tokens_host, 30)
+        self.assertEqual(stats.log_hit_tokens_storage, 30)
+
+
 class TestPrefillAdder(CustomTestCase):
     def setUp(self):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))

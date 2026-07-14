@@ -60,6 +60,10 @@ class PrefillStats:
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+    # Mutually exclusive prefix-cache hit counts; their sum is log_hit_tokens.
+    log_hit_tokens_device: int = 0
+    log_hit_tokens_host: int = 0
+    log_hit_tokens_storage: int = 0
     reprocessed_log_input_tokens: int = 0
     reprocessed_log_hit_tokens: int = 0
     num_pending_tokens: int = 0
@@ -77,6 +81,9 @@ class PrefillStats:
             log_hit_tokens=adder.log_hit_tokens,
             reprocessed_log_input_tokens=adder.reprocessed_log_input_tokens,
             reprocessed_log_hit_tokens=adder.reprocessed_log_hit_tokens,
+            log_hit_tokens_device=adder.log_hit_tokens_device,
+            log_hit_tokens_host=adder.log_hit_tokens_host,
+            log_hit_tokens_storage=adder.log_hit_tokens_storage,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -556,11 +563,29 @@ class SchedulerMetricsReporter:
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
+        cache_split_msg = ""
+        if (
+            prefill_stats.log_hit_tokens_device > 0
+            or prefill_stats.log_hit_tokens_host > 0
+        ):
+            cache_split_msg = (
+                f"#cached-token-device: {prefill_stats.log_hit_tokens_device}, "
+                f"#cached-token-host: {prefill_stats.log_hit_tokens_host}, "
+            )
+        if (
+            getattr(self.scheduler, "enable_hicache_storage", False)
+            or prefill_stats.log_hit_tokens_storage > 0
+        ):
+            cache_split_msg += (
+                f"#cached-token-storage: {prefill_stats.log_hit_tokens_storage}, "
+            )
+
         msg = (
             f"Prefill batch{iter_msg}, "
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
+            f"{cache_split_msg}"
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "

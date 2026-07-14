@@ -40,6 +40,8 @@ from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
+    compute_cache_hit_split,
+    compute_logical_host_hit_span,
     compute_num_matched_prefix_tokens,
 )
 from sglang.srt.mem_cache.allocator.hisparse import (
@@ -492,6 +494,9 @@ class PrefillAdder:
         self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
+        self.log_hit_tokens_device = 0
+        self.log_hit_tokens_host = 0
+        self.log_hit_tokens_storage = 0
         self.reprocessed_log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
@@ -795,6 +800,27 @@ class PrefillAdder:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += extend_input_len
 
+    def _accumulate_hit_token_split(self, req: Req, prefix_len: int) -> None:
+        """Accumulate the mutually exclusive per-tier split once."""
+        if prefix_len <= 0 or req.retracted_stain:
+            return
+        logical_host_span = compute_logical_host_hit_span(
+            prefix_len,
+            req.host_hit_length,
+            req.swa_host_hit_length,
+            req.mamba_host_hit_length,
+            req.mamba_branching_seqlen,
+            req.storage_hit_length,
+        )
+        device, host, storage = compute_cache_hit_split(
+            prefix_len,
+            logical_host_span,
+            req.storage_hit_length,
+        )
+        self.log_hit_tokens_device += device
+        self.log_hit_tokens_host += host
+        self.log_hit_tokens_storage += storage
+
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
             self.rem_dllm_tokens,
@@ -820,6 +846,7 @@ class PrefillAdder:
 
         self.can_run_list.append(req)
 
+        self._accumulate_hit_token_split(req, prefix_len)
         self._update_prefill_budget(
             prefix_len,
             trunc_len,
@@ -1207,6 +1234,7 @@ class PrefillAdder:
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
+                self._accumulate_hit_token_split(req, prefix_len)
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -1251,6 +1279,7 @@ class PrefillAdder:
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
+                self._accumulate_hit_token_split(req, prefix_len)
                 self._update_prefill_budget(
                     prefix_len,
                     trunc_len,
