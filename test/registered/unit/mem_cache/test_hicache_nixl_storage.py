@@ -717,6 +717,49 @@ class TestNixlUnified(CustomTestCase):
         self.assertIs(asymmetric_buffers[0], k_buffer)
         self.assertIs(asymmetric_buffers[1], v_buffer)
 
+    def test_swa_mha_component_keys_match_page_buffer_meta(self):
+        self.hicache.config_suffix = "_test"
+        self.assertEqual(
+            self.hicache._get_hybrid_component_keys(
+                ["page0", "page1"], PoolName.SWA, key_multiplier=2
+            ),
+            [
+                "page0_test_swa_k",
+                "page0_test_swa_v",
+                "page1_test_swa_k",
+                "page1_test_swa_v",
+            ],
+        )
+
+    def test_swa_mha_copy_mode_uses_single_key_per_page(self):
+        self.hicache.config_suffix = "_test"
+        self.assertEqual(
+            self.hicache._get_hybrid_component_keys(
+                ["page0", "page1"], PoolName.SWA, key_multiplier=1
+            ),
+            ["page0_test_swa", "page1_test_swa"],
+        )
+
+    def test_batch_set_v2_skips_on_nonzero_mla_rank(self):
+        from unittest.mock import MagicMock
+
+        self.hicache.backup_skip = True
+        self.hicache._batch_xfer = MagicMock(
+            side_effect=AssertionError("backup rank must not write")
+        )
+        results = self.hicache.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    keys=["page0", "page1"],
+                    host_indices=torch.tensor([0, 1], dtype=torch.int64),
+                )
+            ]
+        )
+
+        self.assertEqual(results[PoolName.SWA], [True, True])
+        self.hicache._batch_xfer.assert_not_called()
+
 
 @unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT not available on this platform")
 class TestNixlDirectIO(CustomTestCase):

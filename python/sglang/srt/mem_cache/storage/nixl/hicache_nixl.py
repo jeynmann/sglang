@@ -1076,6 +1076,11 @@ class HiCacheNixl(HiCacheStorage):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
+        if self.backup_skip:
+            return {
+                transfer.name: [True] * len(transfer.keys or [])
+                for transfer in transfers
+            }
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
             _, key_strs, host_buffers, _, key_multiplier = self._prepare_pool_transfer(
