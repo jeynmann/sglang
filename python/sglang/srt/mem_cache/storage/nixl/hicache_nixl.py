@@ -424,10 +424,44 @@ class HiCacheNixl(HiCacheStorage):
             f"layout={mem_pool_host.layout} zero_copy={self.is_zero_copy}"
         )
 
+    def _validate_doca_memos_hybrid_pool(
+        self, host_pool: HostKVCache, host_pool_name: PoolName
+    ) -> None:
+        if self.backend_selector.backend_name != "DOCA_MEMOS":
+            return
+        get_buffers = getattr(host_pool, "get_hybrid_pool_buffer", None)
+        if get_buffers is None:
+            raise RuntimeError(
+                "HiCache NIXL DOCA_MEMOS requires get_hybrid_pool_buffer() "
+                f"on hybrid pool {host_pool_name!s}."
+            )
+        if getattr(host_pool, "layout", None) not in (
+            "page_first",
+            "page_first_direct",
+        ):
+            raise RuntimeError(
+                "HiCache NIXL DOCA_MEMOS requires --hicache-mem-layout "
+                "page_first or page_first_direct for hybrid pool "
+                f"{host_pool_name!s}."
+            )
+        buffers = list(get_buffers())
+        if not buffers:
+            raise RuntimeError(
+                f"HiCache NIXL DOCA_MEMOS hybrid pool {host_pool_name!s} "
+                "does not expose any host buffers."
+            )
+        for index, buffer in enumerate(buffers):
+            if tensor_mem_backend(buffer) != MEM_BACKEND_HUGEPAGE:
+                raise RuntimeError(
+                    "HiCache NIXL DOCA_MEMOS requires hugetlb-backed host memory "
+                    f"for hybrid pool {host_pool_name!s} buffer {index}."
+                )
+
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if host_pool_name == PoolName.KV:
             return
 
+        self._validate_doca_memos_hybrid_pool(host_pool, host_pool_name)
         is_zero_copy = self._hybrid_pool_supports_zero_copy(host_pool, host_pool_name)
         buffers = (
             [buf for buf in host_pool.get_hybrid_pool_buffer() if buf.numel() > 0]

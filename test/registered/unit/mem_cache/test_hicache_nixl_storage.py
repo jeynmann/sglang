@@ -995,6 +995,35 @@ class TestDocaMemosNixl(unittest.TestCase):
         self.assertIs(dummy.registered_pools[PoolName.MAMBA], host)
         dummy._pre_register_host.assert_called_once()
 
+    def test_doca_memos_hybrid_registration_requires_direct_layout(self):
+        from unittest.mock import MagicMock
+
+        dummy = HiCacheNixl.__new__(HiCacheNixl)
+        dummy.backend_selector = MagicMock(backend_name="DOCA_MEMOS")
+        host = MockHybridPool()
+        host.layout = "layer_first"
+
+        with self.assertRaisesRegex(RuntimeError, "page_first"):
+            dummy._validate_doca_memos_hybrid_pool(host, PoolName.MAMBA)
+
+    def test_doca_memos_hybrid_registration_requires_hugetlb_buffers(self):
+        from unittest.mock import MagicMock, patch
+
+        from sglang.srt.mem_cache.mmap_allocator import MEM_BACKEND_HUGEPAGE
+
+        dummy = HiCacheNixl.__new__(HiCacheNixl)
+        dummy.backend_selector = MagicMock(backend_name="DOCA_MEMOS")
+        host = MockHybridPool()
+        host.layout = "page_first"
+
+        with self.assertRaisesRegex(RuntimeError, "hugetlb-backed"):
+            dummy._validate_doca_memos_hybrid_pool(host, PoolName.MAMBA)
+        with patch(
+            "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_mem_backend",
+            return_value=MEM_BACKEND_HUGEPAGE,
+        ):
+            dummy._validate_doca_memos_hybrid_pool(host, PoolName.MAMBA)
+
     def test_doca_memos_initparams(self):
         from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlBackendConfig
 
