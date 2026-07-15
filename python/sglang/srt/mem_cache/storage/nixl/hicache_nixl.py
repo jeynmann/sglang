@@ -905,6 +905,26 @@ class HiCacheNixl(HiCacheStorage):
             f"total time: {elapsed_ms:.3f} ms, effective bandwidth: {bw:.2f} MB/s"
         )
 
+    @staticmethod
+    def _log_write_descriptors(
+        op_name: str, key_strs: List[str], host_buffers: List[tuple]
+    ) -> None:
+        for descriptor, (key, (addr, size)) in enumerate(zip(key_strs, host_buffers)):
+            logger.info(
+                "HiCacheNixl WRITE submit op=%s descriptor=%d/%d key=%s "
+                "value_len=%d blocks_4k=%d addr=0x%x "
+                "addr_4k_aligned=%s len_4k_aligned=%s",
+                op_name,
+                descriptor,
+                len(key_strs),
+                key,
+                size,
+                (size + 4095) // 4096,
+                addr,
+                addr % 4096 == 0,
+                size % 4096 == 0,
+            )
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -957,6 +977,7 @@ class HiCacheNixl(HiCacheStorage):
         if not key_strs or not host_buffers:
             return [False] * len(keys)
 
+        self._log_write_descriptors("batch_set_v1", key_strs, host_buffers)
         start_time = time.perf_counter()
         results = self._batch_xfer(keys, key_strs, host_buffers, "WRITE")
         elapsed_ms = (time.perf_counter() - start_time) * 1000
@@ -1090,6 +1111,9 @@ class HiCacheNixl(HiCacheStorage):
                 results[transfer.name] = [False] * len(transfer.keys or [])
                 continue
 
+            self._log_write_descriptors(
+                f"batch_set_v2[{transfer.name}]", key_strs, host_buffers
+            )
             start_time = time.perf_counter()
             transfer_results = self._batch_xfer(
                 key_strs, key_strs, host_buffers, "WRITE"
