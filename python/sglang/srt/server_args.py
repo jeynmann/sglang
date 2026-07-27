@@ -113,6 +113,7 @@ LOAD_FORMAT_CHOICES = [
     "npcache",
     "dummy",
     "sharded_state",
+    "presharded",
     "gguf",
     "bitsandbytes",
     "mistral",
@@ -124,6 +125,10 @@ LOAD_FORMAT_CHOICES = [
     "private",
     "runai_streamer",
 ]
+# NOTE: LoadFormat.IPC_CACHE intentionally has no public --load-format choice.
+# It is an internal dispatch format set automatically by ModelRunner when the
+# weight cache is enabled (weight_cache_mode != "off"). Exposing it as a CLI
+# choice let users create contradictory combos (see _handle_load_format).
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
@@ -266,6 +271,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "marlin",
     "humming",
     "experimental_sgl_marlin",
+    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper+
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -512,14 +518,31 @@ class ServerArgs:
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
-            "smaller.",
+            "smaller."
+            '"presharded" performs a normal first-time load (with quantization), '
+            "then dumps a per-rank/per-tensor sharded checkpoint with content "
+            "deduplication into "
+            "<model_path>/presharded/<parallelism+quant subfolder>/. "
+            "Subsequent runs with the same parallelism+quantization config "
+            "load directly from this presharded checkpoint and skip "
+            "re-quantization. "
+            "The dump directory must be on a shared filesystem across all "
+            "ranks/nodes. Optional model_loader_extra_config roots: "
+            "presharded_path (target) and draft_presharded_path (speculative "
+            "draft); each replaces <model_path>/presharded and still gets a "
+            "config subfolder appended. Use a writable path when model_path "
+            "is read-only (e.g. HF cache mounts).",
             choices=LOAD_FORMAT_CHOICES,
         ),
         NS("model"),
     ] = "auto"
     model_loader_extra_config: A[
         str,
-        "Extra config for model loader. This will be passed to the model loader corresponding to the chosen load_format.",
+        "Extra config for model loader. This will be passed to the model loader "
+        "corresponding to the chosen load_format. For load_format=presharded, "
+        "JSON may include presharded_path (target cache root), "
+        "draft_presharded_path (draft cache root), max_file_bytes, "
+        "hash_num_threads, and verify_on_load.",
         NS("model"),
     ] = "{}"
     trust_remote_code: A[
@@ -1734,6 +1757,18 @@ class ServerArgs:
     disable_flashinfer_autotune: A[
         bool, "Disable FlashInfer autotuning.", NS("exec.kernel")
     ] = False
+    flashinfer_autotune_skip_ops: A[
+        Optional[List[str]],
+        Arg(
+            help=(
+                "FlashInfer custom-op identifiers to skip during autotuning. "
+                "Skipped ops use FlashInfer's heuristic fallback. SGLang "
+                "temporarily skips mxfp8_gemm by default due to an IMA."
+            ),
+            nargs="+",
+        ),
+        NS("exec.kernel"),
+    ] = None
     mamba_backend: A[
         str,
         Arg(
@@ -2586,6 +2621,7 @@ class ServerArgs:
                 "eic",
                 "simm",
                 "mori",
+                "shm",
             ],
         ),
         NS("memory"),
@@ -3300,6 +3336,36 @@ class ServerArgs:
         NS("exec.features"),
     ] = False
 
+    weight_cache_mode: A[
+        str,
+        Arg(
+            help="Weight cache mode. 'off': normal disk loading. "
+            "'daemon': launch weight cache daemon (holds weights in GPU memory). "
+            "Engine-spawned daemons are co-terminal with the engine and do NOT "
+            "persist across restarts, so this alone does not speed up restart "
+            "(the first start is slower). For fast recovery, run the standalone "
+            "daemon (python -m sglang.srt.weight_cache.daemon) and connect with "
+            "'client'. 'client': connect to existing daemon and load via IPC.",
+            choices=["off", "daemon", "client"],
+        ),
+        NS("model"),
+    ] = "off"
+    weight_cache_socket: A[
+        Optional[str],
+        Arg(
+            help="Unix socket path for weight cache daemon (client mode)."
+            "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
+        ),
+        NS("model"),
+    ] = None
+    weight_cache_timeout: A[
+        int,
+        Arg(
+            help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
+        ),
+        NS("model"),
+    ] = 1800
+
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins
     # -------------------------------------------------------------------------
@@ -3570,6 +3636,75 @@ class ServerArgs:
                 "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
                 "--disable-cuda-graph for correctness of the bidirectional "
                 "prompt attention."
+            )
+
+        # EmbeddingGemma is a Gemma3TextModel with bidirectional prompt
+        # attention. Prefix reuse and split prefills would reuse K/V states
+        # whose values depend on later prompt tokens, so both are invalid.
+        # Breakable CUDA Graph captures one complete prefill and is the graph
+        # mode validated for this encoder-style attention.
+        if getattr(model_config, "is_embedding_gemma", False):
+            # This is an encoder-only model even though its HF architecture is
+            # named Gemma3TextModel. Marking it as embedding mode enables the
+            # FlashAttention raw-K/V fast path, which does not write or read
+            # the paged KV cache during its single prefill forward.
+            self.is_embedding = True
+            self.disable_radix_cache = True
+            self.chunked_prefill_size = -1
+            # Submit a list-valued embeddings request atomically so BCG can
+            # replay its full prefill batch instead of starting item zero
+            # while the remaining texts are still being tokenized.
+            self.enable_tokenizer_batch_encode = True
+            requested_prefill_backend = (
+                self.prefill_attention_backend or self.attention_backend
+            )
+            if (
+                is_cuda()
+                and (is_sm90_supported() or is_sm100_supported())
+                and requested_prefill_backend in (None, "fa3", "fa4")
+            ):
+                # Hopper/Blackwell's default FA backend can consume raw K/V
+                # tensors for a single embedding prefill. Enable its no-KV
+                # pool path before memory-pool sizing; an explicit non-FA
+                # backend retains the existing paged-KV behavior.
+                self.prefill_only_disable_kv_cache = True
+                self._validate_prefill_only_disable_kv_cache_args()
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            if is_cuda() and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                self.cuda_graph_config.prefill.backend = Backend.BREAKABLE
+                # CUDA-graph sizing has already run by this point and derives
+                # its generic maximum from the 8K chunked-prefill default.
+                # On the Hopper/Blackwell FA raw-K/V path, raise the unlocked
+                # default to a full eight-way 2K embedding batch; callers can
+                # still override this for larger aggregate prefills.
+                prefill_config = self.cuda_graph_config.prefill
+                # Unit-level capability tests may invoke this hook without
+                # running the full CUDA-graph configuration parser, which is
+                # where this internal lock set is normally initialized.
+                # Treat that minimal construction as having no user-locked
+                # graph settings.
+                cuda_graph_config_locked = getattr(
+                    self, "_cuda_graph_config_locked", set()
+                )
+                if (Phase.PREFILL, "max_bs") not in cuda_graph_config_locked:
+                    prefill_config.max_bs = max(
+                        prefill_config.max_bs or 0,
+                        model_config.context_len,
+                        16384,
+                    )
+                    if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
+                        prefill_config.bs = (
+                            self._generate_prefill_cuda_graph_batch_sizes(
+                                prefill_config.max_bs
+                            )
+                        )
+            elif not is_cuda():
+                # BCG is CUDA-only. Other graph backends do not support this
+                # encoder-style prefill, so retain the eager Triton path.
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.info(
+                "EmbeddingGemma detected: disabling radix cache and chunked "
+                "prefill; using breakable CUDA graph for CUDA prefill."
             )
 
         if (
@@ -4182,6 +4317,8 @@ class ServerArgs:
                 "MoE A2A backend",
                 lambda: _resolved_view(self).moe_a2a_backend != "none",
             ),
+            # Dynamo blocks LoRA under tc_piecewise (per-batch LoRABatchInfo
+            # rebinds break guards); breakable/full support LoRA.
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
                 "multimodal model",
@@ -4224,19 +4361,6 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
-            # TcPiecewise makes the trtllm_mla prefill fall back to the
-            # flashinfer-MLA implementation, which faults (illegal address)
-            # on an FP8 KV cache.
-            (
-                "MLA attention with FP8 KV cache",
-                lambda: self.kv_cache_dtype.startswith("fp8")
-                and (
-                    _resolved_view(self).attention_backend
-                    in ("trtllm_mla", "flashinfer_mla")
-                    or _resolved_view(self).prefill_attention_backend
-                    in ("trtllm_mla", "flashinfer_mla")
-                ),
-            ),
         ]
         for _name, predicate in rules:
             if predicate():
@@ -4270,8 +4394,6 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
-            # BCG capture + LoRA adapter weights exceed host RAM headroom.
-            ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
             (
                 "MoE A2A backend",
@@ -6937,6 +7059,31 @@ class ServerArgs:
                 self.validate_transfer_engine()
             )
 
+        # "ipc_cache" is an internal-only load format: ModelRunner sets it
+        # automatically when the weight cache is enabled, and it is not a public
+        # --load-format choice. Setting it directly is always wrong (no daemon is
+        # launched, and fallback_load_format inherits a nonsensical format), so
+        # reject it and point at the knob (defense-in-depth; the CLI already
+        # rejects it via LOAD_FORMAT_CHOICES).
+        if self.load_format == "ipc_cache":
+            raise ValueError(
+                "load_format='ipc_cache' is an internal-only format and must not "
+                "be set directly. Enable the weight cache via --weight-cache-mode "
+                "client (connect to an existing daemon) or daemon (launch one); "
+                "that selects IPC loading automatically."
+            )
+
+        # Speculative decoding loads an extra draft model whose weights the
+        # daemon does not export, so refuse the combination up front instead of
+        # failing deep inside draft-worker load (draft-model daemon TBD).
+        if self.weight_cache_mode != "off" and self.speculative_algorithm is not None:
+            raise ValueError(
+                "--weight-cache-mode is not supported together with speculative "
+                "decoding (--speculative-algorithm): the weight cache daemon does "
+                "not export the draft model's weights. Disable one of them "
+                "(--weight-cache-mode off) for this configuration."
+            )
+
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.
 
@@ -7239,16 +7386,6 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        # Custom all-reduce v2 uses IPC handles and is intra-node only. Force-disable
-        # on multi-node so the dispatch falls back to the legacy CustomAllreduce path.
-        if self.nnodes > 1 and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
-            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
-                logger.warning(
-                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
-                    "(custom all-reduce v2 is intra-node only).",
-                    self.nnodes,
-                )
-            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
         if self.debug_cuda_graph:
             if not (is_cuda() or is_hip()):
                 logger.warning(
@@ -7262,9 +7399,11 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
-        if self.enable_deepseek_v4_fp4_indexer and not is_sm100_supported():
+        if self.enable_deepseek_v4_fp4_indexer and not (
+            is_sm100_supported() or is_sm120_supported()
+        ):
             raise ValueError(
-                "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
+                "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
         # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
@@ -8934,7 +9073,7 @@ class PortArgs:
             # (no availability-based search). If incrementing would
             # overflow the valid TCP range, decrement instead.
             NUM_DERIVED_PORTS = 5
-            if server_args.is_ep_scale_joiner:
+            if server_args.is_ep_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
@@ -8954,7 +9093,7 @@ class PortArgs:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
-            is_joiner = server_args.is_ep_scale_joiner
+            is_joiner = server_args.is_ep_joiner
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
             # dist_init_port / nccl_port (rendezvous uses the externally-managed
             # store; see distributed/bootstrap.py:_resolve_dist_init_method), so
