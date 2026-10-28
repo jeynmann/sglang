@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
+    host_memory_allocation_bytes,
     host_memory_budget_bytes,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -109,13 +110,16 @@ class DSAIndexerPoolHost(HostKVCache):
             self.clear()
             return
 
-        buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
-        requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
-        available_bytes = host_memory_budget_bytes(requested_bytes)
-        if requested_bytes > available_bytes:
+        allocation_bytes = host_memory_allocation_bytes(
+            self.get_mapping_lengths(), self.allocator, self.device_pool.device
+        )
+        available_bytes = host_memory_budget_bytes(
+            allocation_bytes, self.allocator, self.device_pool.device
+        )
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for DSA indexer hierarchical cache. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
         draft_layer_num = self.layer_num - self.target_layer_num
@@ -124,8 +128,8 @@ class DSAIndexerPoolHost(HostKVCache):
                 "Allocating %.2f GB host memory for DSA indexer (layout=%s), "
                 "packed MTP layers: "
                 "target_layers=%d, draft_layers=%d, total_layers=%d.",
-                requested_bytes / 1e9,
-                layout,
+                allocation_bytes / 1e9,
+                self.layout,
                 self.target_layer_num,
                 draft_layer_num,
                 self.layer_num,
@@ -133,8 +137,8 @@ class DSAIndexerPoolHost(HostKVCache):
         else:
             logger.info(
                 "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
-                requested_bytes / 1e9,
-                layout,
+                allocation_bytes / 1e9,
+                self.layout,
             )
         self.init_kv_buffer()
         self._init_write_back_staging_buffers()
