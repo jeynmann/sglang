@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import threading
 
-import psutil
 import torch
 
 from sglang.jit_kernel.hicache import (
@@ -28,8 +27,8 @@ from sglang.jit_kernel.hicache import (
 from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
     HostKVCache,
+    host_memory_preflight,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -118,6 +117,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
         self._init_write_back_staging_buffers()
 
+    def get_hybrid_pool_buffer(self):
+        return [self.k_buffer, self.v_buffer]
+
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
@@ -162,6 +164,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=(
+                self.page_size * self.layout_dim
+                if self.layout in ("page_first", "page_first_direct")
+                else None
+            ),
         )
         return buffer
 
@@ -654,9 +661,9 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
         self.size_per_token = self.get_size_per_token()
 
-        host_mem = psutil.virtual_memory()
-        requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        requested_bytes, available_bytes = host_memory_preflight(
+            self.get_mapping_lengths(), self.allocator, self.device_pool.device
+        )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for MiniMax index-K hierarchical cache. "
@@ -722,10 +729,30 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=(
+                self.page_size * self.layout_dim
+                if self.layout in ("page_first", "page_first_direct")
+                else None
+            ),
         )
 
     def get_hybrid_pool_buffer(self):
         return [self.k_buffer]
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        if self.layout not in ("page_first", "page_first_direct"):
+            return False
+        page_stride_bytes = (
+            self.layer_num
+            * self.page_size
+            * self.head_num
+            * self.head_dim
+            * self.dtype.itemsize
+        )
+        return (
+            self.k_buffer.data_ptr() % page_size_bytes == 0
+            and page_stride_bytes % page_size_bytes == 0
+        )
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
@@ -956,6 +983,11 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def get_ksize_per_token(self):
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
 
+    def get_mapping_lengths(self) -> list[int]:
+        kv_bytes = self.size * self.size_per_token
+        k_bytes = self.size * self.get_ksize_per_token()
+        return [k_bytes, kv_bytes - k_bytes]
+
     def init_kv_buffer(self):
         if self.layout == "page_first":
             k_dims = (self.size, self.layer_num, self.head_num, self.head_dim)
@@ -993,6 +1025,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=self.page_size * self._k_layout_dim(),
         )
         v_buffer = alloc_func(
             v_dims,
@@ -1000,6 +1033,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=self.page_size * self._v_layout_dim(),
         )
         return (k_buffer, v_buffer)
 
