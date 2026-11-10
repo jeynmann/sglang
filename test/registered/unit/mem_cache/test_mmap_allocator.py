@@ -26,6 +26,17 @@ from sglang.srt.mem_cache.storage.mmap.mmap_allocator import _mmap_prefaulted
 
 
 class TestMmapAllocator(unittest.TestCase):
+    def test_hugepage_override_restores_after_allocation_error(self):
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("off"),
+            envs.SGLANG_HUGEPAGE_SIZE.override(""),
+        ):
+            with self.assertRaisesRegex(ValueError, "SGLANG_HUGEPAGE_SIZE"):
+                with envs.SGLANG_HUGEPAGE_MODE.override("required"):
+                    mmap_allocator.alloc_mmap((4,), torch.float32)
+            self.assertEqual(envs.SGLANG_HUGEPAGE_MODE.get(), "off")
+            self.assertEqual(envs.SGLANG_HUGEPAGE_SIZE.get(), "")
+
     def test_alloc_mmap_hugepage_modes(self):
         with (
             self.subTest(mode="off"),

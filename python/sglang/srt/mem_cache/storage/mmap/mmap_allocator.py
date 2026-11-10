@@ -140,21 +140,11 @@ def hugetlb_pool_free_bytes() -> int:
     return free_bytes
 
 
-def _tensor_storage_key(tensor: torch.Tensor) -> int:
-    return tensor.untyped_storage().data_ptr()
-
-
 def _track_hugepage_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    key = _tensor_storage_key(tensor)
+    key = tensor.untyped_storage().data_ptr()
     _hugepage_storage_keys.add(key)
     weakref.finalize(tensor, _hugepage_storage_keys.discard, key)
     return tensor
-
-
-def _mmap_page_size_and_flags(mode: str, hugepage_size: int) -> tuple[int, int]:
-    if mode == HUGEPAGE_MODE_OFF or hugepage_size == 0:
-        return mmap.PAGESIZE, 0
-    return hugepage_size, _HUGEPAGE_MMAP_FLAGS[hugepage_size]
 
 
 @functools.cache
@@ -248,7 +238,10 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     """
     hugepage_size = hugepage_size_requested()
     mode = hugepage_mode(hugepage_size)
-    page_size, extra_flags = _mmap_page_size_and_flags(mode, hugepage_size)
+    if mode == HUGEPAGE_MODE_OFF or hugepage_size == 0:
+        page_size, extra_flags = mmap.PAGESIZE, 0
+    else:
+        page_size, extra_flags = hugepage_size, _HUGEPAGE_MMAP_FLAGS[hugepage_size]
     if mode == HUGEPAGE_MODE_REQUIRED and not extra_flags:
         raise ValueError(
             "SGLANG_HUGEPAGE_MODE=required requires SGLANG_HUGEPAGE_SIZE=2MB or 1GB."

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from collections import defaultdict
 from functools import lru_cache
@@ -368,5 +369,9 @@ def device_uses_allocator(device: Union[str, torch.device]) -> bool:
     # ALLOC_MEMORY_FUNCS is keyed by device *type* string ("npu"/"musa"/...),
     # not torch.device objects; a torch.device key silently falls back to the
     # default (host_register), misreporting pin-memory devices.
-    key = device.type if isinstance(device, torch.device) else str(device)
+    key = (
+        device.type
+        if isinstance(device, torch.device)
+        else str(device).partition(":")[0]
+    )
     return ALLOC_MEMORY_FUNCS[key] is alloc_with_host_register

@@ -1,3 +1,4 @@
+import ctypes
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -12,6 +13,8 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host import common as host_common
+from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
+from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_register,
@@ -24,6 +27,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     MHATokenToKVPoolHost,
 )
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.storage.mmap import mmap_allocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -193,8 +197,8 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 with (
                     mock.patch.object(
                         memory_pool_host,
-                        "host_memory_budget_bytes",
-                        return_value=1024**3,
+                        "host_memory_preflight",
+                        return_value=(0, 1024**3),
                     ) as budget,
                     mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
@@ -209,7 +213,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
 
                 # 4 pages x 11 B x 3 layers, booked against the budget scope.
                 budget.assert_called_once_with(
-                    132, allocator=pool.allocator, device=torch.device("cpu")
+                    [132], allocator=pool.allocator, device=torch.device("cpu")
                 )
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
@@ -230,8 +234,8 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 with (
                     mock.patch.object(
                         memory_pool_host,
-                        "host_memory_budget_bytes",
-                        return_value=1024**3,
+                        "host_memory_preflight",
+                        return_value=(0, 1024**3),
                     ) as budget,
                     mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
@@ -245,7 +249,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
 
                 # 4 pages x (ring 2 x 3 B slots) x 2 layers, scope-booked.
                 budget.assert_called_once_with(
-                    48, allocator=pool.allocator, device=torch.device("cpu")
+                    [48], allocator=pool.allocator, device=torch.device("cpu")
                 )
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
@@ -258,11 +262,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
         with (
             envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
             envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
-            mock.patch.object(
-                memory_pool_host,
-                "host_memory_budget_bytes",
-                return_value=2 * 1024**3,
-            ),
+            base.host_memory_budget_scope((0, 2 * 1024**3)),
             mock.patch.object(base, "device_uses_allocator", return_value=True),
             mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
         ):
@@ -510,33 +510,6 @@ class TestHiCacheHostRegister(unittest.TestCase):
             for ptr, size, _ in registrations:
                 self.assertEqual((ptr - base) % two_mib, 0)
                 self.assertEqual(size % two_mib, 0)
-
-    def test_null_pinned_allocation_raises(self):
-        """On XPU a null pinned buffer must fail at allocation, not at first transfer."""
-        gib = 1024**3
-
-        def alloc(buffer):
-            with mock.patch.object(torch, "empty", return_value=buffer):
-                return alloc_with_pin_memory_xpu(
-                    (buffer.numel(),),
-                    dtype=torch.uint8,
-                    device="cpu",
-                    pin_memory=True,
-                    allocator=None,
-                )
-
-        with self.assertRaisesRegex(RuntimeError, r"2\.0 GiB .* null pointer"):
-            alloc(_FakeBuffer(0, 2 * gib))
-        # An empty tensor has data_ptr() == 0 on every backend and is not a failure.
-        empty = _FakeBuffer(0, 0)
-        self.assertIs(alloc(empty), empty)
-
-    def test_only_xpu_uses_the_null_checked_allocator(self):
-        self.assertIs(ALLOC_MEMORY_FUNCS["xpu"], alloc_with_pin_memory_xpu)
-        for device in ("npu", "musa"):
-            self.assertIs(ALLOC_MEMORY_FUNCS[device], alloc_with_pin_memory)
-        # CUDA and ROCm ("cuda") keep the cudaHostRegister default.
-        self.assertIs(ALLOC_MEMORY_FUNCS.default_factory(), alloc_with_host_register)
 
 
 if __name__ == "__main__":

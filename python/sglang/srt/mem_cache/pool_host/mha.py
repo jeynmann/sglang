@@ -36,8 +36,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
-    host_memory_allocation_bytes,
-    host_memory_budget_bytes,
+    host_memory_preflight,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -810,11 +809,8 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
         self.size_per_token = self.get_size_per_token()
 
-        allocation_bytes = host_memory_allocation_bytes(
+        allocation_bytes, available_bytes = host_memory_preflight(
             self.get_mapping_lengths(), self.allocator, self.device_pool.device
-        )
-        available_bytes = host_memory_budget_bytes(
-            allocation_bytes, self.allocator, self.device_pool.device
         )
         if allocation_bytes > available_bytes:
             raise ValueError(
@@ -1269,9 +1265,6 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             registration_granularity_bytes=self.page_size * self._v_layout_dim(),
         )
         return (k_buffer, v_buffer)
-
-    def get_hybrid_pool_buffer(self):
-        return [self.k_buffer, self.v_buffer]
 
     def _k_token_stride_size(self) -> int:
         return self.head_num * self.head_dim * self.dtype.itemsize

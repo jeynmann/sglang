@@ -19,8 +19,7 @@ from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
-    host_memory_allocation_bytes,
-    host_memory_budget_bytes,
+    host_memory_preflight,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -110,11 +109,8 @@ class DSAIndexerPoolHost(HostKVCache):
             self.clear()
             return
 
-        allocation_bytes = host_memory_allocation_bytes(
+        allocation_bytes, available_bytes = host_memory_preflight(
             self.get_mapping_lengths(), self.allocator, self.device_pool.device
-        )
-        available_bytes = host_memory_budget_bytes(
-            allocation_bytes, self.allocator, self.device_pool.device
         )
         if allocation_bytes > available_bytes:
             raise ValueError(
@@ -218,6 +214,15 @@ class DSAIndexerPoolHost(HostKVCache):
             dtype=self.indexer_dtype,
             device=self.device_pool.device,
         )
+
+    def get_mapping_lengths(self) -> list[int]:
+        # The indexer allocates a guard page beyond the anchor's token capacity.
+        return [
+            self.indexer_page_num
+            * self.layer_num
+            * self.indexer_page_stride_size
+            * self.indexer_dtype.itemsize
+        ]
 
     def get_hybrid_pool_buffer(self):
         return [self.index_k_with_scale_buffer]
