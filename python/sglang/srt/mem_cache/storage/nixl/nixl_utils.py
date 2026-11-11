@@ -192,11 +192,6 @@ class NixlBackendSelection:
                 if self.nixlconfig
                 else {}
             )
-            if self.backend_name == "DOCA_MEMOS":
-                # HiCache requires real existence checks rather than the
-                # plugin's assume-success default.
-                initparams.setdefault("query_mem_mode", "actual")
-
             # Create backend and set memory type (S3 OBJ requires a bucket; DOCA_MEMOS does not)
             if self.backend_name == "OBJ" and "bucket" not in initparams:
                 bucket = os.environ.get("AWS_DEFAULT_BUCKET")

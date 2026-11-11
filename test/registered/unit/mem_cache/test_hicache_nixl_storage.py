@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 import os
 import shutil
@@ -11,6 +11,9 @@ import subprocess
 import tempfile
 import time
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -281,8 +284,8 @@ class TestNixlUnified(CustomTestCase):
 
     def setUp(self):
         """Set up test environment."""
-        self.test_dir = "/tmp/test_nixl_unified"
-        os.makedirs(self.test_dir, exist_ok=True)
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_unified_")
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
 
         # Disable O_DIRECT here: these tests use small, arbitrarily-aligned
         # tensors that do not satisfy the sector-alignment constraints required
@@ -302,6 +305,9 @@ class TestNixlUnified(CustomTestCase):
             extra_config={
                 "plugin": {"posix": {"active": True}},
                 "use_direct_io": False,
+                # Round trips require retained files regardless of runner disk
+                # pressure. Cleaner behavior has its own dedicated test suite.
+                "l3_cleaner_enabled": False,
             },
         )
 
@@ -310,16 +316,9 @@ class TestNixlUnified(CustomTestCase):
                 storage_config=self.storage_config,
                 file_path=self.test_dir,
             )
+            self.addCleanup(self.hicache.close)
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
-
-    def tearDown(self):
-        """Release NIXL registrations before their backing tensors are collected."""
-        hicache = getattr(self, "hicache", None)
-        if hicache is not None:
-            hicache.close()
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir, ignore_errors=True)
 
     @staticmethod
     def _open_fds() -> int:
@@ -539,6 +538,8 @@ class TestNixlUnified(CustomTestCase):
         )
         try:
             hicache = HiCacheNixl(storage_config=obj_config, file_path="")
+            self.addCleanup(hicache.close)
+            return hicache
         except Exception as e:
             self.skipTest(f"NIXL OBJ backend unavailable: {e}")
         self.addCleanup(hicache.close)
@@ -566,6 +567,16 @@ class TestNixlUnified(CustomTestCase):
         )
         self.assertEqual(results, [True, True])
 
+    def test_posix_exists_before_and_after_write(self):
+        pool = MockMemPoolHost(is_zero_copy_mode=False)
+        self.hicache.register_mem_pool_host(pool)
+        keys = ["exists-first", "exists-second"]
+        indices = torch.arange(len(keys) * pool.page_size, dtype=torch.int64)
+        self.assertEqual(self.hicache.batch_exists(keys), 0)
+        self.assertEqual(self.hicache.batch_set_v1(keys, indices), [True, True])
+        self.assertEqual(self.hicache.batch_exists(keys + ["missing"]), 2)
+        self.assertEqual(self.hicache.batch_exists(["missing"] + keys), 0)
+
     def test_batch_exists_zero_copy_mla_uses_single_key_denominator(self):
         """Zero-copy MLA batch_exists counts one storage key per logical key."""
         self.hicache.is_zero_copy = True
@@ -587,6 +598,69 @@ class TestNixlUnified(CustomTestCase):
 
         self.assertEqual(self.hicache.batch_exists(["key1", "key2"]), 1)
 
+    def test_dsa_indexer_bounce_round_trip_preserves_every_byte(self):
+        """Index pages must survive copy fallback when the main KV dtype is bf16."""
+        from sglang.srt.mem_cache.memory_pool_host import (
+            DSAIndexerPoolHost,
+        )
+
+        pool = SimpleNamespace(
+            layer_num=2,
+            device="cpu",
+            layer_shard_enabled=False,
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            end_layer=2,
+            index_head_dim=128,
+            quant_block_size=128,
+            page_size=64,
+            index_page_size=64,
+            skip_topk_layers=[False, False],
+            index_k_with_scale_buffer=[
+                torch.empty((4, 64 * 132), dtype=torch.uint8) for _ in range(2)
+            ],
+        )
+        anchor = SimpleNamespace(
+            page_size=64,
+            layout="page_first",
+            size=256,
+            page_num=4,
+            mtp_draft_device_pools=(),
+        )
+        host = DSAIndexerPoolHost(
+            device_pool=pool,
+            anchor_host=anchor,
+            layout=anchor.layout,
+            pin_memory=False,
+        )
+        self.addCleanup(host.destroy)
+        # Empty buffer list fails the zero-copy gate, forcing the bounce path.
+        with mock.patch.object(host, "get_hybrid_pool_buffer", return_value=[]):
+            self.hicache.register_mem_host_pool_v2(host, PoolName.INDEXER)
+        self.addCleanup(self.hicache.close)
+        ctx = self.hicache._hybrid_pool_ctx[PoolName.INDEXER]
+        self.assertFalse(ctx.is_zero_copy)
+        expected = (
+            torch.arange(host.get_dummy_flat_data_page().numel())
+            .remainder(251)
+            .to(torch.uint8)
+        )
+        host.set_from_flat_data_page(64, expected)
+        transfer = PoolTransfer(
+            name=PoolName.INDEXER,
+            keys=["dsa-index-bytes"],
+            host_indices=torch.arange(64, 128),
+        )
+        self.assertEqual(
+            self.hicache.batch_set_v2([transfer]), {PoolName.INDEXER: [True]}
+        )
+        host.set_from_flat_data_page(64, torch.zeros_like(expected))
+        ctx.bounce_get.zero_()
+        self.assertEqual(
+            self.hicache.batch_get_v2([transfer]), {PoolName.INDEXER: [True]}
+        )
+        self.assertTrue(torch.equal(host.get_data_page(64), expected))
+
     def test_register_mem_host_pool_v2_uses_zero_copy_when_supported(self):
         pool = MockHybridPool(expose_zero_copy=True)
         self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
@@ -594,6 +668,41 @@ class TestNixlUnified(CustomTestCase):
         ctx = self.hicache._hybrid_pool_ctx[PoolName.MAMBA]
         self.assertTrue(ctx.is_zero_copy)
         self.assertIs(ctx.host_pool, pool)
+
+    def test_mla_mamba_round_trip_keeps_each_tp_rank(self):
+        """MLA shares KV keys, but Mamba checkpoints must not overwrite another rank."""
+        for zero_copy in (False, True):
+            with self.subTest(zero_copy=zero_copy):
+                caches, pools, expected = [], [], []
+                transfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=[f"same_prefix_{zero_copy}"],
+                    host_indices=torch.tensor([0]),
+                )
+                for rank in range(2):
+                    config = replace(
+                        self.storage_config, tp_rank=rank, is_mla_model=True
+                    )
+                    cache = HiCacheNixl(storage_config=config, file_path=self.test_dir)
+                    self.addCleanup(cache.close)
+                    pool = MockHybridPool(expose_zero_copy=zero_copy)
+                    cache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+                    pool.temporal_buffer[0].fill_(rank + 11)
+                    pool.conv_buffer[0][0].fill_(rank + 21)
+                    expected.append(pool.get_data_page(0).clone())
+                    caches.append(cache)
+                    pools.append(pool)
+                    self.assertEqual(
+                        cache.batch_set_v2([transfer])[PoolName.MAMBA], [True]
+                    )
+
+                for cache, pool, page in zip(caches, pools, expected):
+                    pool.temporal_buffer.zero_()
+                    pool.conv_buffer[0].zero_()
+                    self.assertEqual(
+                        cache.batch_get_v2([transfer])[PoolName.MAMBA], [True]
+                    )
+                    self.assertTrue(torch.equal(pool.get_data_page(0), page))
 
     def test_register_mem_host_pool_v2_uses_persistent_bounce_otherwise(self):
         pool = MockHybridPool(expose_zero_copy=False)
@@ -967,6 +1076,8 @@ class TestDocaMemosNixl(unittest.TestCase):
         dummy.backend_selector = MagicMock(backend_name="DOCA_MEMOS")
         dummy.needs_page_alignment = True
         dummy.config_suffix = "@test"
+        dummy.tp_config_suffix = "@test_tp0"
+        dummy._backend_converts_key = False
         dummy._hybrid_pool_ctx = {}
         dummy.registered_pools = {}
         dummy._pre_register_host = MagicMock()
@@ -983,49 +1094,97 @@ class TestDocaMemosNixl(unittest.TestCase):
     def test_mamba_without_temporal_state_round_trip(self):
         from unittest.mock import patch
 
-        from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
-            MEM_BACKEND_HUGEPAGE,
+        for backend_converts_key in (False, True):
+            with self.subTest(backend_converts_key=backend_converts_key):
+                dummy = self._make_registration_target()
+                dummy._backend_converts_key = backend_converts_key
+                host = self._make_hybrid_pool(
+                    expose_zero_copy=False, has_temporal=False
+                )
+                with patch(
+                    "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_uses_hugepage",
+                    return_value=True,
+                ):
+                    dummy.register_mem_host_pool_v2(host, PoolName.MAMBA)
+                ctx = dummy._hybrid_pool_ctx[PoolName.MAMBA]
+                stored_page = None
+
+                def fake_xfer(keys, key_strs, host_buffers, direction):
+                    nonlocal stored_page
+                    formatted = dummy._format_key(key_strs[0])
+                    if backend_converts_key:
+                        self.assertEqual(formatted, key_strs[0])
+                    else:
+                        self.assertEqual(len(formatted), 32)
+                    if direction == "WRITE":
+                        stored_page = ctx.bounce_set[0].clone()
+                    else:
+                        ctx.bounce_get[0].copy_(stored_page)
+                    return [True] * len(key_strs)
+
+                transfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["conv-only"],
+                    host_indices=torch.tensor([0], dtype=torch.int64),
+                )
+                host.conv_buffer[0][0].fill_(7)
+                dummy._batch_xfer = fake_xfer
+                dummy.batch_set_v2([transfer])
+                host.conv_buffer[0][0].zero_()
+                dummy.batch_get_v2([transfer])
+                self.assertTrue(torch.all(host.conv_buffer[0][0] == 7))
+
+    def test_batch_set_get_v2_rejects_mismatched_indices_before_chunking(self):
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.hicache_storage import STORAGE_BATCH_SIZE
+
+        page_count = STORAGE_BATCH_SIZE + 1
+        cases = (
+            ("none", None),
+            ("extra", torch.arange(page_count + 1, dtype=torch.int64)),
+            ("short", torch.arange(page_count - 1, dtype=torch.int64)),
         )
+        for label, host_indices in cases:
+            with self.subTest(label=label):
+                dummy = self._make_registration_target()
+                host = MockHybridPool(num_pages=page_count, expose_zero_copy=True)
+                host.layout = "page_first"
+                with patch(
+                    "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_uses_hugepage",
+                    return_value=True,
+                ):
+                    dummy.register_mem_host_pool_v2(host, PoolName.MAMBA)
+                self.assertTrue(dummy._hybrid_pool_ctx[PoolName.MAMBA].is_zero_copy)
 
-        dummy = self._make_registration_target()
-        host = self._make_hybrid_pool(expose_zero_copy=False, has_temporal=False)
-        with patch(
-            "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_mem_backend",
-            return_value=MEM_BACKEND_HUGEPAGE,
-        ):
-            dummy.register_mem_host_pool_v2(host, PoolName.MAMBA)
-        ctx = dummy._hybrid_pool_ctx[PoolName.MAMBA]
-        stored_page = None
+                xfer_calls = []
 
-        def fake_xfer(keys, key_strs, host_buffers, direction):
-            nonlocal stored_page
-            self.assertEqual(len(dummy._format_key(key_strs[0])), 32)
-            if direction == "WRITE":
-                stored_page = ctx.bounce_set[0].clone()
-            else:
-                ctx.bounce_get[0].copy_(stored_page)
-            return [True] * len(key_strs)
+                def fake_xfer(keys, key_strs, host_buffers, direction):
+                    xfer_calls.append(direction)
+                    return [True] * len(key_strs)
 
-        transfer = PoolTransfer(
-            name=PoolName.MAMBA,
-            keys=["conv-only"],
-            host_indices=torch.tensor([0], dtype=torch.int64),
-        )
-        host.conv_buffer[0][0].fill_(7)
-        dummy._batch_xfer = fake_xfer
-        dummy.batch_set_v2([transfer])
-        host.conv_buffer[0][0].zero_()
-        dummy.batch_get_v2([transfer])
-        self.assertTrue(torch.all(host.conv_buffer[0][0] == 7))
+                dummy._batch_xfer = fake_xfer
+                transfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=[f"k{i}" for i in range(page_count)],
+                    host_indices=host_indices,
+                )
+                self.assertEqual(
+                    dummy.batch_set_v2([transfer]),
+                    {PoolName.MAMBA: [False] * page_count},
+                )
+                self.assertEqual(
+                    dummy.batch_get_v2([transfer]),
+                    {PoolName.MAMBA: [False] * page_count},
+                )
+                # No chunk may transfer when the full transfer is invalid.
+                self.assertEqual(xfer_calls, [])
 
     def test_asymmetric_kv_set_get(self):
         from unittest.mock import patch
 
         from sglang.srt.mem_cache.pool_host.mha import (
             AsymmetricMHATokenToKVPoolHost,
-        )
-        from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
-            MEM_BACKEND_HUGEPAGE,
         )
 
         for layout in ("page_first", "page_first_direct"):
@@ -1055,8 +1214,8 @@ class TestDocaMemosNixl(unittest.TestCase):
 
                 memos = self._make_registration_target()
                 with patch(
-                    "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_mem_backend",
-                    return_value=MEM_BACKEND_HUGEPAGE,
+                    "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_uses_hugepage",
+                    return_value=True,
                 ):
                     memos.register_mem_pool_host(host)
                 memos._host_regs = [object()]
@@ -1101,6 +1260,90 @@ class TestDocaMemosNixl(unittest.TestCase):
                 self.assertTrue(torch.equal(k_page, expected[0]))
                 self.assertTrue(torch.equal(v_page, expected[1]))
 
+    def test_asymmetric_kv_set_get_v2(self):
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.pool_host.mha import (
+            AsymmetricMHATokenToKVPoolHost,
+        )
+
+        for layout in ("page_first", "page_first_direct"):
+            with self.subTest(layout=layout):
+                host = AsymmetricMHATokenToKVPoolHost.__new__(
+                    AsymmetricMHATokenToKVPoolHost
+                )
+                host.layout = layout
+                host.page_size = 2
+                host.layer_num = 2
+                host.head_num = 1
+                host.head_dim = 4
+                host.v_head_dim = 6
+                host.dtype = torch.uint8
+                host.device = "cpu"
+                host.pin_memory = False
+                if layout == "page_first":
+                    host.kv_buffer = (
+                        torch.zeros((4, 2, 1, 4), dtype=host.dtype),
+                        torch.zeros((4, 2, 1, 6), dtype=host.dtype),
+                    )
+                else:
+                    host.kv_buffer = (
+                        torch.zeros((2, 2, 2, 1, 4), dtype=host.dtype),
+                        torch.zeros((2, 2, 2, 1, 6), dtype=host.dtype),
+                    )
+
+                memos = self._make_registration_target()
+                with patch(
+                    "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_uses_hugepage",
+                    return_value=True,
+                ):
+                    memos.register_mem_host_pool_v2(host, PoolName.SWA)
+                ctx = memos._hybrid_pool_ctx[PoolName.SWA]
+                # Tiny test strides cannot be 4KiB-aligned: bounce path.
+                self.assertFalse(ctx.is_zero_copy)
+
+                k_page = (
+                    host.k_buffer[: host.page_size]
+                    if layout == "page_first"
+                    else host.k_buffer[0]
+                )
+                v_page = (
+                    host.v_buffer[: host.page_size]
+                    if layout == "page_first"
+                    else host.v_buffer[0]
+                )
+                k_page.copy_(
+                    torch.arange(k_page.numel(), dtype=host.dtype).reshape_as(k_page)
+                )
+                v_page.copy_(
+                    torch.arange(
+                        100, 100 + v_page.numel(), dtype=host.dtype
+                    ).reshape_as(v_page)
+                )
+                expected = (k_page.clone(), v_page.clone())
+                stored_page = None
+
+                def fake_xfer(keys, key_strs, host_buffers, direction):
+                    nonlocal stored_page
+                    if direction == "WRITE":
+                        stored_page = ctx.bounce_set[0].clone()
+                    else:
+                        ctx.bounce_get[0].copy_(stored_page)
+                    return [True] * len(key_strs)
+
+                transfer = PoolTransfer(
+                    name=PoolName.SWA,
+                    keys=[f"asymmetric-v2-{layout}"],
+                    host_indices=torch.tensor([0, 1], dtype=torch.int64),
+                )
+                memos._batch_xfer = fake_xfer
+                self.assertEqual(memos.batch_set_v2([transfer]), {PoolName.SWA: [True]})
+                k_page.zero_()
+                v_page.zero_()
+                self.assertEqual(memos.batch_get_v2([transfer]), {PoolName.SWA: [True]})
+                self.assertTrue(torch.equal(k_page, expected[0]))
+                self.assertTrue(torch.equal(v_page, expected[1]))
+
     def test_doca_memos_initparams(self):
         from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlBackendConfig
 
@@ -1128,22 +1371,22 @@ class TestDocaMemosNixl(unittest.TestCase):
             plugin="DOCA_MEMOS",
             nixlconfig=NixlBackendConfig({}),
         )
-        with envs.SGLANG_HUGEPAGE_MODE.override(
-            "prefer"
-        ), envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+        ):
             self.assertFalse(selector.create_backend(agent))
 
         selector = NixlBackendSelection(
             plugin="DOCA_MEMOS",
             nixlconfig=NixlBackendConfig({}),
         )
-        with envs.SGLANG_HUGEPAGE_MODE.override(
-            "required"
-        ), envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("required"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+        ):
             selector.create_backend(agent)
-        agent.create_backend.assert_called_once_with(
-            "DOCA_MEMOS", {"query_mem_mode": "actual"}
-        )
+        agent.create_backend.assert_called_once_with("DOCA_MEMOS", {})
 
 
 if __name__ == "__main__":

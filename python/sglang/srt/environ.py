@@ -80,12 +80,14 @@ class EnvField:
         backup_value = os.environ.get(self.name)
         backup_set_to_none = self._set_to_none
         self.set(value)
-        yield
-        if backup_present:
-            os.environ[self.name] = backup_value
-        else:
-            os.environ.pop(self.name, None)
-        self._set_to_none = backup_set_to_none
+        try:
+            yield
+        finally:
+            if backup_present:
+                os.environ[self.name] = backup_value
+            else:
+                os.environ.pop(self.name, None)
+            self._set_to_none = backup_set_to_none
 
     def clear(self):
         os.environ.pop(self.name, None)
@@ -227,7 +229,6 @@ class InvariantCheckLevel(IntEnum):
 
 
 class Envs:
-
     # Raise on bare server_args field assignments after resolution; mutation
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
@@ -495,10 +496,9 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
-    # off: normal pages; prefer: hugepages with normal-page fallback;
-    # required: hugepages only, failing immediately when unavailable.
-    # Empty preserves compatibility: off when SIZE is empty, otherwise prefer.
+    # off: normal pages; prefer: hugepages with fallback; required: hugetlb only.
     SGLANG_HUGEPAGE_MODE = EnvStr("")
+    SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(1)
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)

@@ -116,6 +116,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    def get_mapping_lengths(self) -> list[int]:
+        if self.layout != "page_first_kv_split":
+            return super().get_mapping_lengths()
+        widths = [self.kv_lora_rank, self.qk_rope_head_dim]
+        if self.device_pool.index_head_dim is not None:
+            widths.append(self.device_pool.index_head_dim)
+        rows = self.page_num * self.layer_num * self.page_size
+        return [rows * width * self.dtype.itemsize for width in widths]
+
     def init_kv_buffer(self):
         if self.layout == "layer_first":
             dims = (
@@ -155,6 +164,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                registration_granularity_bytes=(
+                    self.page_size
+                    * self.layer_num
+                    * self.kv_cache_dim
+                    * self.dtype.itemsize
+                    if self.layout in ("page_first", "page_first_direct")
+                    else None
+                ),
             )
             self.v_buffer = alloc_func(
                 (*base_dims, self.qk_rope_head_dim),
@@ -162,6 +179,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                registration_granularity_bytes=(
+                    self.page_size
+                    * self.layer_num
+                    * self.kv_cache_dim
+                    * self.dtype.itemsize
+                    if self.layout in ("page_first", "page_first_direct")
+                    else None
+                ),
             )
             self.index_k_buffer = None
             if self.device_pool.index_head_dim is not None:
@@ -171,6 +196,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
+                    registration_granularity_bytes=(
+                        self.page_size
+                        * self.layer_num
+                        * self.kv_cache_dim
+                        * self.dtype.itemsize
+                        if self.layout in ("page_first", "page_first_direct")
+                        else None
+                    ),
                 )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
@@ -187,6 +220,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=(
+                self.page_size
+                * self.layer_num
+                * self.kv_cache_dim
+                * self.dtype.itemsize
+                if self.layout in ("page_first", "page_first_direct")
+                else None
+            ),
         )
         return buffer
 

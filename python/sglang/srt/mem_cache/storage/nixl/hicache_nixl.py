@@ -21,10 +21,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.mha import AsymmetricMHATokenToKVPoolHost
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
-    MEM_BACKEND_HUGEPAGE,
-    tensor_mem_backend,
+    alloc_mmap,
+    tensor_uses_hugepage,
 )
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
 
@@ -91,16 +90,6 @@ class HiCacheNixl(HiCacheStorage):
 
         use_direct_io = nixlconfig.get_use_direct_io()
 
-        # Might be better to be unified across HiCache backends and moved to HiCacheController
-        storage_dirs = _parse_storage_dirs(
-            envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
-        )
-        self.file_manager = (
-            NixlFileManager(storage_dirs, use_direct_io=use_direct_io)
-            if plugin not in NixlBackendSelection.OBJ_PLUGINS
-            else None
-        )
-
         tp_rank, tp_size, model_name = (
             storage_config.tp_rank,
             storage_config.tp_size,
@@ -113,22 +102,37 @@ class HiCacheNixl(HiCacheStorage):
         self.backup_skip = self.is_mla_model and storage_config.tp_rank != 0
 
         model_name = "-".join(model_name.split("/")) if model_name else ""
+        self.tp_config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
 
         if self.is_mla_model:
             self.config_suffix = f"_{model_name}"
         else:
-            self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+            self.config_suffix = self.tp_config_suffix
 
         sync_mode = getattr(
             nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT
         )
-        agent_config = nixl_agent_config(backends=[])
+        # nixl 1.6.0 renamed nixl_agent_config fields:
+        # enable_pthread -> enable_prog_thread, enable_listen ->
+        # enable_listen_thread, port -> listen_port.
+        try:
+            agent_config = nixl_agent_config(backends=[], enable_prog_thread=True)
+            prog_thread = True
+        except TypeError:
+            agent_config = nixl_agent_config(backends=[])
+            prog_thread = agent_config.enable_pthread
         self.agent_name = f"hicache_nixl_{str(uuid.uuid4())}"
         self.agent = nixl_agent(self.agent_name, agent_config)
         bind_cfg = nixlBind.nixlAgentConfig()
-        bind_cfg.useProgThread = agent_config.enable_pthread
-        bind_cfg.useListenThread = agent_config.enable_listen
-        bind_cfg.listenPort = agent_config.port
+        bind_cfg.useProgThread = prog_thread
+        bind_cfg.useListenThread = getattr(
+            agent_config,
+            "enable_listen_thread",
+            getattr(agent_config, "enable_listen", False),
+        )
+        bind_cfg.listenPort = getattr(
+            agent_config, "listen_port", getattr(agent_config, "port", 0)
+        )
         bind_cfg.syncMode = sync_mode
         bind_cfg.pthrDelay = 0
         bind_cfg.lthrDelay = 100000
@@ -139,6 +143,26 @@ class HiCacheNixl(HiCacheStorage):
         self.backend_selector = NixlBackendSelection(plugin, nixlconfig)
         if not self.backend_selector.create_backend(self.agent):
             raise RuntimeError("Failed to create NIXL backend")
+
+        # Might be better to be unified across HiCache backends and moved to HiCacheController
+        storage_dirs = _parse_storage_dirs(
+            envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
+        )
+        self.file_manager = (
+            NixlFileManager(storage_dirs, use_direct_io=use_direct_io)
+            if self.backend_selector.mem_type == "FILE"
+            else None
+        )
+
+        convert_key = str(
+            nixlconfig.get_backend_initparams(self.backend_selector.backend_name).get(
+                "convert_key_to_128bit", ""
+            )
+        ).lower()
+        self._backend_converts_key = (
+            self.backend_selector.backend_name == "DOCA_MEMOS"
+            and convert_key in ("y", "yes", "on", "1", "true", "enable")
+        )
 
         self.registry = NixlRegistry(
             self.agent,
@@ -194,12 +218,17 @@ class HiCacheNixl(HiCacheStorage):
 
     def _format_key(self, key: str) -> str:
         if self.backend_selector.backend_name == "DOCA_MEMOS":
+            if self._backend_converts_key:
+                return key
             return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
         if self.backend_selector.mem_type == "FILE":
             return self.file_manager.get_file_path(key)
         return key
 
-    def _get_suffixed_key(self, key: str) -> str:
+    def _get_suffixed_key(self, key: str, pool_name: Optional[PoolName] = None) -> str:
+        # Mamba state is TP-sharded even when the model's MLA KV is replicated.
+        if pool_name == PoolName.MAMBA:
+            return key + self.tp_config_suffix
         return key + self.config_suffix
 
     def _get_component_key(
@@ -207,7 +236,7 @@ class HiCacheNixl(HiCacheStorage):
     ) -> str:
         if component_name in (None, PoolName.KV):
             return self._get_suffixed_key(key)
-        return f"{self._get_suffixed_key(key)}_{component_name}"
+        return f"{self._get_suffixed_key(key, component_name)}_{component_name}"
 
     def _get_component_keys(
         self, keys: List[str], pool_name: Optional[PoolName] = None
@@ -238,7 +267,7 @@ class HiCacheNixl(HiCacheStorage):
             suffixes = [f"_{pool_name}_{i}" for i in range(key_multiplier)]
 
         return [
-            f"{self._get_suffixed_key(key)}{suffix}"
+            f"{self._get_suffixed_key(key, pool_name)}{suffix}"
             for key in keys
             for suffix in suffixes
         ]
@@ -417,7 +446,7 @@ class HiCacheNixl(HiCacheStorage):
                 )
                 self.is_zero_copy = False
             elif self.backend_selector.backend_name == "DOCA_MEMOS" and any(
-                tensor_mem_backend(buf) != MEM_BACKEND_HUGEPAGE for buf in kv_buffers
+                not tensor_uses_hugepage(buf) for buf in kv_buffers
             ):
                 logger.warning(
                     "HiCacheNixl: DOCA_MEMOS zero-copy requires hugetlb-backed "
@@ -436,24 +465,7 @@ class HiCacheNixl(HiCacheStorage):
             # One bounce buffer per direction so set/get run lock-free across
             # the prefetch and backup threads. The logical payload matches one
             # flat data page; DOCA_MEMOS pads each physical slot to 4 KiB.
-            asymmetric_pool = (
-                self._get_asymmetric_pool(mem_pool_host)
-                if self.backend_selector.backend_name == "DOCA_MEMOS"
-                else None
-            )
-            if asymmetric_pool is not None:
-                page_numel = (
-                    asymmetric_pool.layer_num
-                    * asymmetric_pool.page_size
-                    * asymmetric_pool.head_num
-                    * (asymmetric_pool.head_dim + asymmetric_pool.v_head_dim)
-                )
-                page_dtype = asymmetric_pool.dtype
-            else:
-                sample = mem_pool_host.get_dummy_flat_data_page()
-                page_numel = sample.numel()
-                page_dtype = sample.dtype
-                del sample
+            page_numel, page_dtype = self._flat_page_shape(mem_pool_host)
             self._bounce_payload_numel = page_numel
             pin_memory = bool(getattr(mem_pool_host, "pin_memory", False))
             self._bounce_page_bytes = page_numel * page_dtype.itemsize
@@ -503,9 +515,7 @@ class HiCacheNixl(HiCacheStorage):
                     host_pool_name,
                 )
         if is_zero_copy and is_doca_memos:
-            is_zero_copy = all(
-                tensor_mem_backend(buf) == MEM_BACKEND_HUGEPAGE for buf in buffers
-            )
+            is_zero_copy = all(tensor_uses_hugepage(buf) for buf in buffers)
             if not is_zero_copy:
                 logger.warning(
                     "HiCacheNixl: DOCA_MEMOS zero-copy pool %s is not "
@@ -523,26 +533,20 @@ class HiCacheNixl(HiCacheStorage):
                 host_pool=host_pool, is_zero_copy=True
             )
         else:
-            sample = host_pool.get_dummy_flat_data_page()
-            page_numel = sample.numel()
+            # Serialized index and Mamba pages can differ from the pool dtype.
+            page_numel, page_dtype = self._flat_page_shape(host_pool)
+            page_bytes = page_numel * page_dtype.itemsize
+
             pin_memory = bool(getattr(host_pool, "pin_memory", False))
-            page_bytes = page_numel * sample.element_size()
             if is_doca_memos:
                 page_bytes = (page_bytes + 4095) // 4096 * 4096
-            slot_numel = page_bytes // sample.element_size()
+            slot_numel = page_bytes // page_dtype.itemsize
             bounce_set = self._alloc_registered(
-                slot_numel,
-                sample.dtype,
-                pin_memory,
-                f"{host_pool_name}_bounce_set",
+                slot_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_set"
             )
             bounce_get = self._alloc_registered(
-                slot_numel,
-                sample.dtype,
-                pin_memory,
-                f"{host_pool_name}_bounce_get",
+                slot_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_get"
             )
-            del sample
             self._hybrid_pool_ctx[host_pool_name] = _HybridPoolContext(
                 host_pool=host_pool,
                 is_zero_copy=False,
@@ -569,6 +573,26 @@ class HiCacheNixl(HiCacheStorage):
         if not isinstance(data_pool, AsymmetricMHATokenToKVPoolHost):
             return None
         return data_pool
+
+    def _flat_page_shape(self, host_pool: HostKVCache) -> tuple[int, torch.dtype]:
+        asymmetric_pool = (
+            self._get_asymmetric_pool(host_pool)
+            if self.backend_selector.backend_name == "DOCA_MEMOS"
+            else None
+        )
+        if asymmetric_pool is not None:
+            return (
+                asymmetric_pool.layer_num
+                * asymmetric_pool.page_size
+                * asymmetric_pool.head_num
+                * (asymmetric_pool.head_dim + asymmetric_pool.v_head_dim),
+                asymmetric_pool.dtype,
+            )
+        sample = host_pool.get_dummy_flat_data_page()
+        page_numel = sample.numel()
+        page_dtype = sample.dtype
+        del sample
+        return page_numel, page_dtype
 
     def _get_asymmetric_flat_data_page(
         self, asymmetric_pool: AsymmetricMHATokenToKVPoolHost, index: int
@@ -720,8 +744,17 @@ class HiCacheNixl(HiCacheStorage):
             return host_pool, [], [], [], 0
 
         if for_write:
+            asymmetric_pool = (
+                self._get_asymmetric_pool(host_pool)
+                if self.backend_selector.backend_name == "DOCA_MEMOS"
+                else None
+            )
             for i, page_offset in enumerate(page_offsets):
-                src = host_pool.get_data_page(page_offset, flat=True)
+                src = (
+                    self._get_asymmetric_flat_data_page(asymmetric_pool, page_offset)
+                    if asymmetric_pool is not None
+                    else host_pool.get_data_page(page_offset, flat=True)
+                )
                 self._copy_to_bounce_slot(bounce[i], src, ctx.bounce_payload_numel)
 
         host_buffers = self._get_bounce_slot_buffers(
@@ -742,6 +775,15 @@ class HiCacheNixl(HiCacheStorage):
             return
 
         page_size = getattr(ctx.host_pool, "page_size", 1) or 1
+        expected = len(keys) * page_size
+        if host_indices is None or host_indices.numel() != expected:
+            logger.error(
+                "HiCacheNixl: pool %s indices length mismatch: expected %s, got %s",
+                transfer.name,
+                expected,
+                host_indices.numel() if host_indices is not None else 0,
+            )
+            return
         for start in range(0, len(keys), STORAGE_BATCH_SIZE):
             end = min(start + STORAGE_BATCH_SIZE, len(keys))
             index_start = start * page_size
@@ -763,7 +805,7 @@ class HiCacheNixl(HiCacheStorage):
         buf = alloc_mmap((STORAGE_BATCH_SIZE, page_numel), dtype)
         if (
             self.backend_selector.backend_name == "DOCA_MEMOS"
-            and tensor_mem_backend(buf) != MEM_BACKEND_HUGEPAGE
+            and not tensor_uses_hugepage(buf)
         ):
             raise RuntimeError(
                 "HiCache NIXL DOCA_MEMOS bounce buffers must be hugetlb-backed. "
@@ -1168,15 +1210,23 @@ class HiCacheNixl(HiCacheStorage):
                 ctx = self._hybrid_pool_ctx[transfer.name]
                 page_results = self._page_results(transfer_results, key_multiplier)
                 if not ctx.is_zero_copy:
+                    asymmetric_pool = (
+                        self._get_asymmetric_pool(host_pool)
+                        if self.backend_selector.backend_name == "DOCA_MEMOS"
+                        else None
+                    )
                     for ok, page_offset, data_page in zip(
                         page_results, page_offsets, ctx.bounce_get
                     ):
                         if not ok:
                             break
-                        host_pool.set_from_flat_data_page(
-                            page_offset,
-                            data_page.reshape(-1)[: ctx.bounce_payload_numel],
-                        )
+                        flat_page = data_page.reshape(-1)[: ctx.bounce_payload_numel]
+                        if asymmetric_pool is not None:
+                            self._set_asymmetric_flat_data_page(
+                                asymmetric_pool, page_offset, flat_page
+                            )
+                        else:
+                            host_pool.set_from_flat_data_page(page_offset, flat_page)
                 pool_results.extend(page_results)
                 if not all(page_results):
                     break

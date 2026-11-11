@@ -1,5 +1,6 @@
 import ctypes
 import ctypes.util
+import functools
 import logging
 import math
 import mmap
@@ -11,6 +12,7 @@ import psutil
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.host_memory import cgroup_hugetlb_headroom_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -42,25 +44,17 @@ _MAP_HUGE_2MB = 21 << 26  # 0x1400000
 _MAP_HUGE_1GB = 30 << 26  # 0x78000000
 _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
-
-MEM_BACKEND_UNKNOWN = 0
-MEM_BACKEND_MMAP = 1
-MEM_BACKEND_HUGEPAGE = 2
+_PROT_RW = mmap.PROT_READ | mmap.PROT_WRITE
 
 HUGEPAGE_BYTES_2MB = 2 * 1024 * 1024
 HUGEPAGE_BYTES_1GB = 1024 * 1024 * 1024
 
-_HUGEPAGE_SIZE_BYTES = {
-    "2MB": HUGEPAGE_BYTES_2MB,
-    "1GB": HUGEPAGE_BYTES_1GB,
-}
+# Hugetlb pools as the kernel exposes them: one sysfs directory per page size.
+_HUGEPAGE_SYSFS_DIR = "/sys/kernel/mm/hugepages"
+_HUGEPAGE_SIZES = {"2MB": HUGEPAGE_BYTES_2MB, "1GB": HUGEPAGE_BYTES_1GB}
 _HUGEPAGE_MMAP_FLAGS = {
     HUGEPAGE_BYTES_2MB: _MAP_HUGETLB | _MAP_HUGE_2MB,
     HUGEPAGE_BYTES_1GB: _MAP_HUGETLB | _MAP_HUGE_1GB,
-}
-_HUGEPAGE_SYSFS_PATHS = {
-    HUGEPAGE_BYTES_2MB: "/sys/kernel/mm/hugepages/hugepages-2048kB",
-    HUGEPAGE_BYTES_1GB: "/sys/kernel/mm/hugepages/hugepages-1048576kB",
 }
 
 HUGEPAGE_MODE_OFF = "off"
@@ -72,26 +66,29 @@ _HUGEPAGE_MODES = {
     HUGEPAGE_MODE_REQUIRED,
 }
 
-# Host RAM to leave free when sizing HiCache pools (OS, other processes).
-# This reserve applies only to normal RAM. Pre-reserved hugetlb pages are
-# dedicated to hugepage allocations and must not be reduced by it.
-HICACHE_HOST_MEMORY_RESERVE_BYTES = 10 * (1024**3)
-
-_tensor_mem_backend: dict[int, int] = {}
+_hugepage_storage_keys: set[int] = set()
 
 
 def hugepage_size_requested() -> int:
-    configured_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
-    if not configured_size:
+    """Hugepage size in bytes that SGLANG_HUGEPAGE_SIZE asks alloc_mmap() for.
+
+    Return 0 when the variable is unset or unrecognized (the latter with a
+    warning). Re-read per call, not cached, so that
+    envs.SGLANG_HUGEPAGE_SIZE.override() works in tests.
+    """
+    raw = envs.SGLANG_HUGEPAGE_SIZE.get() or ""
+    key = raw.strip().upper()
+    if key == "":
         return 0
-    hugepage_size = _HUGEPAGE_SIZE_BYTES.get(configured_size)
-    if hugepage_size is None:
+    size = _HUGEPAGE_SIZES.get(key)
+    if size is None:
         logger.warning(
-            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB' or '1GB'.",
-            envs.SGLANG_HUGEPAGE_SIZE.get(),
+            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB' or '1GB'. "
+            "Treating it as unset.",
+            raw,
         )
         return 0
-    return hugepage_size
+    return size
 
 
 def hugepage_mode(hugepage_size: int) -> str:
@@ -110,16 +107,216 @@ def hugepage_mode(hugepage_size: int) -> str:
     return configured_mode
 
 
-def hugepage_available_bytes(hugepage_size: int) -> int:
-    sysfs_path = _HUGEPAGE_SYSFS_PATHS.get(hugepage_size)
-    if sysfs_path is None:
+def _hugetlb_count(pool_dir: str, counter: str) -> int:
+    with open(os.path.join(pool_dir, counter)) as f:
+        return int(f.read().strip())
+
+
+def hugetlb_pool_free_bytes() -> int:
+    """Bytes a new alloc_mmap() mapping could take from the hugetlb pool, else 0.
+
+    That is the pool of the size SGLANG_HUGEPAGE_SIZE names, provided the
+    selected mode enables hugepages and libc is loadable. Read from sysfs,
+    which reports every pool size (the whole hugetlb pool is excluded from
+    MemAvailable), and bounded by the hugetlb cgroup limit when one applies
+    (containers). Pages a mapping has reserved but not yet faulted in still
+    count as free, so only ``free - resv`` can back a new mapping.
+    """
+    size = hugepage_size_requested()
+    if hugepage_mode(size) == HUGEPAGE_MODE_OFF or size == 0 or _libc is None:
         return 0
+    pool_dir = os.path.join(_HUGEPAGE_SYSFS_DIR, f"hugepages-{size // 1024}kB")
     try:
-        with open(os.path.join(sysfs_path, "free_hugepages")) as f:
-            return int(f.read().strip()) * hugepage_size
+        free = _hugetlb_count(pool_dir, "free_hugepages")
+        resv = _hugetlb_count(pool_dir, "resv_hugepages")
     except (OSError, ValueError) as e:
-        logger.warning("Failed to read free_hugepages from %s: %s", sysfs_path, e)
+        logger.warning(
+            "Cannot read the hugetlb pool at %s (%s); not crediting it.", pool_dir, e
+        )
         return 0
+    free_bytes = max(free - resv, 0) * size
+    cgroup_headroom = cgroup_hugetlb_headroom_bytes(size)
+    if cgroup_headroom is not None:
+        free_bytes = min(free_bytes, cgroup_headroom)
+    return free_bytes
+
+
+def _track_hugepage_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    key = tensor.untyped_storage().data_ptr()
+    _hugepage_storage_keys.add(key)
+    weakref.finalize(tensor, _hugepage_storage_keys.discard, key)
+    return tensor
+
+
+@functools.cache
+def _has_madv_populate_write() -> bool:
+    """Whether this kernel implements MADV_POPULATE_WRITE (Linux 5.14+).
+
+    Probed once on a single page. Probing on the real allocation is not an
+    option: the answer decides how that allocation gets pre-faulted.
+    """
+    try:
+        probe = mmap.mmap(
+            -1,
+            mmap.PAGESIZE,
+            flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+            prot=_PROT_RW,
+        )
+    except OSError:
+        return False
+    try:
+        probe.madvise(_MADV_POPULATE_WRITE)
+        return True
+    except (OSError, ValueError):
+        return False
+    finally:
+        probe.close()
+
+
+def _mmap_prefaulted(fileno: int, alloc_bytes: int, flags: int) -> mmap.mmap:
+    """mmap `alloc_bytes` with every page already faulted in and writable.
+
+    cudaHostRegister has to pin real, pre-faulted pages, so these mappings can
+    never be handed back lazily. MAP_POPULATE and MADV_POPULATE_WRITE each give
+    that guarantee on their own, but asking for both makes the kernel walk the
+    whole mapping twice. Prefer the madvise, which additionally reports a
+    failure (e.g. ENOMEM) instead of leaving pages quietly unpopulated, and fall
+    back to MAP_POPULATE only where the kernel lacks it.
+    """
+    if _has_madv_populate_write():
+        mm = mmap.mmap(fileno, alloc_bytes, flags=flags, prot=_PROT_RW)
+        mm.madvise(_MADV_POPULATE_WRITE)
+        return mm
+    return mmap.mmap(fileno, alloc_bytes, flags=flags | _MAP_POPULATE, prot=_PROT_RW)
+
+
+def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
+    """Call mmap via libc with hugepage flags and return an owning ctypes array.
+
+    munmap fires automatically via weakref.finalize when the array is
+    garbage-collected (i.e. when the tensor that wraps it is freed).
+    """
+    ptr = _libc.mmap(
+        None,
+        alloc_bytes,
+        mmap.PROT_READ | mmap.PROT_WRITE,
+        mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE | extra_flags,
+        -1,
+        0,
+    )
+    if ptr is None or ptr == _MAP_FAILED:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    array = (ctypes.c_uint8 * n_bytes).from_address(ptr)
+    weakref.finalize(array, _libc.munmap, ctypes.c_void_p(ptr), alloc_bytes)
+    return array
+
+
+def tensor_uses_hugepage(tensor) -> bool:
+    """Whether the tensor's mapping came from _alloc_hugepage (MAP_HUGETLB).
+
+    cudaHostRegister rejects hugetlb-backed ranges whose base or size is not
+    hugepage-aligned, so the registration path must know which buffers are
+    hugepage-backed -- a prefer-mode fallback to plain pages must not round up.
+    """
+    untyped_storage = getattr(tensor, "untyped_storage", None)
+    if untyped_storage is None:
+        return False
+    return untyped_storage().data_ptr() in _hugepage_storage_keys
+
+
+def _alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    """Allocate a host tensor via anonymous mmap.
+
+    MAP_SHARED + MAP_POPULATE are both required so cudaHostRegister pins real,
+    pre-faulted physical pages (otherwise pinning can race with COW or page
+    faults and the device ends up reading stale data).
+
+    ``SGLANG_HUGEPAGE_MODE=prefer`` falls back to normal pages when hugetlb
+    allocation fails. ``required`` raises instead of falling back.
+
+    The tensor owns the mapping; munmap fires when the tensor is freed.
+    """
+    hugepage_size = hugepage_size_requested()
+    mode = hugepage_mode(hugepage_size)
+    if mode == HUGEPAGE_MODE_OFF or hugepage_size == 0:
+        page_size, extra_flags = mmap.PAGESIZE, 0
+    else:
+        page_size, extra_flags = hugepage_size, _HUGEPAGE_MMAP_FLAGS[hugepage_size]
+    if mode == HUGEPAGE_MODE_REQUIRED and not extra_flags:
+        raise ValueError(
+            "SGLANG_HUGEPAGE_MODE=required requires SGLANG_HUGEPAGE_SIZE=2MB or 1GB."
+        )
+    n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
+
+    alloc_bytes = math.ceil(n_bytes / page_size) * page_size
+
+    if extra_flags:
+        if _libc is None:
+            error_message = (
+                "Hugepage mmap requested but the C library could not be loaded; "
+                f"SGLANG_HUGEPAGE_SIZE={envs.SGLANG_HUGEPAGE_SIZE.get()}."
+            )
+            if mode == HUGEPAGE_MODE_REQUIRED:
+                raise RuntimeError(error_message)
+            logger.error("%s Falling back to plain mmap.", error_message)
+        else:
+            try:
+                array = _alloc_hugepage(n_bytes, alloc_bytes, extra_flags)
+                return _track_hugepage_tensor(
+                    torch.frombuffer(array, dtype=dtype, count=math.prod(dims)).reshape(
+                        dims
+                    )
+                )
+            except OSError as e:
+                error_message = (
+                    f"Hugepage mmap via libc failed ({e}); "
+                    f"SGLANG_HUGEPAGE_SIZE={envs.SGLANG_HUGEPAGE_SIZE.get()}."
+                )
+                if mode == HUGEPAGE_MODE_REQUIRED:
+                    raise RuntimeError(error_message) from e
+                logger.error("%s Falling back to plain mmap.", error_message)
+        alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
+
+    # Plain mmap path -- used directly when no hugepages requested, or as fallback.
+    # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
+    # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
+    mm = _mmap_prefaulted(-1, alloc_bytes, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS)
+    return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+
+
+MEM_BACKEND_UNKNOWN = 0
+MEM_BACKEND_MMAP = 1
+MEM_BACKEND_HUGEPAGE = 2
+
+
+HICACHE_HOST_MEMORY_RESERVE_BYTES = 10 * (1024**3)
+_tensor_mem_backend: dict[int, int] = {}
+
+
+def _tensor_storage_key(tensor: torch.Tensor) -> int:
+    return tensor.untyped_storage().data_ptr()
+
+
+def _track_tensor_backend(tensor: torch.Tensor, backend: int) -> torch.Tensor:
+    key = _tensor_storage_key(tensor)
+    _tensor_mem_backend[key] = backend
+    weakref.finalize(tensor, _tensor_mem_backend.pop, key, None)
+    return tensor
+
+
+def tensor_mem_backend(tensor: torch.Tensor) -> int:
+    return _tensor_mem_backend.get(_tensor_storage_key(tensor), MEM_BACKEND_UNKNOWN)
+
+
+def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    tensor = _alloc_mmap(dims, dtype)
+    backend = MEM_BACKEND_HUGEPAGE if tensor_uses_hugepage(tensor) else MEM_BACKEND_MMAP
+    return _track_tensor_backend(tensor, backend)
+
+
+def hugepage_available_bytes(hugepage_size: int) -> int:
+    return hugetlb_pool_free_bytes() if hugepage_size else 0
 
 
 def memory_available_bytes() -> int:
@@ -147,124 +344,6 @@ def memory_available_bytes() -> int:
             hugepage_available_bytes(hugepage_size),
         )
     raise AssertionError(f"Unexpected hugepage mode: {mode}")
-
-
-def _tensor_storage_key(tensor: torch.Tensor) -> int:
-    return tensor.untyped_storage().data_ptr()
-
-
-def _track_tensor_backend(tensor: torch.Tensor, backend: int) -> torch.Tensor:
-    key = _tensor_storage_key(tensor)
-    _tensor_mem_backend[key] = backend
-    weakref.finalize(tensor, _tensor_mem_backend.pop, key, None)
-    return tensor
-
-
-def tensor_mem_backend(tensor: torch.Tensor) -> int:
-    return _tensor_mem_backend.get(_tensor_storage_key(tensor), MEM_BACKEND_UNKNOWN)
-
-
-def _mmap_page_size_and_flags(mode: str, hugepage_size: int) -> tuple[int, int]:
-    if mode == HUGEPAGE_MODE_OFF or hugepage_size == 0:
-        return mmap.PAGESIZE, 0
-    return hugepage_size, _HUGEPAGE_MMAP_FLAGS[hugepage_size]
-
-
-def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
-    """Call mmap via libc with hugepage flags and return an owning ctypes array.
-
-    munmap fires automatically via weakref.finalize when the array is
-    garbage-collected (i.e. when the tensor that wraps it is freed).
-    """
-    ptr = _libc.mmap(
-        None,
-        alloc_bytes,
-        mmap.PROT_READ | mmap.PROT_WRITE,
-        mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE | extra_flags,
-        -1,
-        0,
-    )
-    if ptr is None or ptr == _MAP_FAILED:
-        errno = ctypes.get_errno()
-        raise OSError(errno, os.strerror(errno))
-    array = (ctypes.c_uint8 * n_bytes).from_address(ptr)
-    weakref.finalize(array, _libc.munmap, ctypes.c_void_p(ptr), alloc_bytes)
-    return array
-
-
-def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
-    """Allocate a host tensor via anonymous mmap.
-
-    MAP_SHARED + MAP_POPULATE are both required so cudaHostRegister pins real,
-    pre-faulted physical pages (otherwise pinning can race with COW or page
-    faults and the device ends up reading stale data).
-
-    ``SGLANG_HUGEPAGE_MODE=prefer`` falls back to normal pages when hugetlb
-    allocation fails. ``required`` raises instead of falling back.
-
-    The tensor owns the mapping; munmap fires when the tensor is freed.
-    """
-    # Re-read per call (not cached) so that envs.SGLANG_HUGEPAGE_SIZE.override()
-    # works correctly in tests.
-    hugepage_size = hugepage_size_requested()
-    mode = hugepage_mode(hugepage_size)
-    page_size, extra_flags = _mmap_page_size_and_flags(mode, hugepage_size)
-    if mode == HUGEPAGE_MODE_REQUIRED and not extra_flags:
-        raise ValueError(
-            "SGLANG_HUGEPAGE_MODE=required requires " "SGLANG_HUGEPAGE_SIZE=2MB or 1GB."
-        )
-    n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
-
-    alloc_bytes = math.ceil(n_bytes / page_size) * page_size
-
-    if extra_flags:
-        if _libc is None:
-            error_message = (
-                "Hugepage mmap requested but libc.so.6 could not be loaded; "
-                f"SGLANG_HUGEPAGE_SIZE={envs.SGLANG_HUGEPAGE_SIZE.get()}."
-            )
-            if mode == HUGEPAGE_MODE_REQUIRED:
-                raise RuntimeError(error_message)
-            logger.error("%s Falling back to plain mmap.", error_message)
-        else:
-            try:
-                array = _alloc_hugepage(n_bytes, alloc_bytes, extra_flags)
-                return _track_tensor_backend(
-                    torch.frombuffer(array, dtype=dtype, count=math.prod(dims)).reshape(
-                        dims
-                    ),
-                    MEM_BACKEND_HUGEPAGE,
-                )
-            except OSError as e:
-                error_message = (
-                    f"Hugepage mmap via libc failed ({e}); "
-                    f"SGLANG_HUGEPAGE_SIZE={envs.SGLANG_HUGEPAGE_SIZE.get()}."
-                )
-                if mode == HUGEPAGE_MODE_REQUIRED:
-                    raise RuntimeError(error_message) from e
-                logger.error("%s Falling back to plain mmap.", error_message)
-        alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
-
-    # Plain mmap path -- used directly when no hugepages requested, or as fallback.
-    # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
-    # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
-    mm = mmap.mmap(
-        -1,
-        alloc_bytes,
-        flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
-        prot=mmap.PROT_READ | mmap.PROT_WRITE,
-    )
-    try:
-        # MADV_POPULATE_WRITE guarantees pages are populated and writable,
-        # throwing an error on failure (e.g. out of memory).
-        mm.madvise(_MADV_POPULATE_WRITE)
-    except OSError:
-        # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
-        pass
-    return _track_tensor_backend(
-        torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims),
-        MEM_BACKEND_MMAP,
-    )
 
 
 def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.mmap]:

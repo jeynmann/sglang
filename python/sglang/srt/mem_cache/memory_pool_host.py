@@ -20,7 +20,6 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MambaPool
-from sglang.srt.mem_cache.storage.mmap.mmap_allocator import memory_available_bytes
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -52,6 +51,7 @@ logger = logging.getLogger(__name__)
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
+    host_memory_preflight,
     sync_fixed_hicache_size,
     synchronized,
 )
@@ -63,7 +63,6 @@ from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
 
 class MambaPoolHost(HostKVCache):
-
     def __init__(
         self,
         device_pool: MambaPool,
@@ -120,8 +119,9 @@ class MambaPoolHost(HostKVCache):
                 device_pool.size,
             )
 
-        requested_bytes = self.size * self.size_per_token
-        available_bytes = memory_available_bytes()
+        requested_bytes, available_bytes = host_memory_preflight(
+            self.get_mapping_lengths(), self.allocator, self.device_pool.device
+        )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -157,6 +157,18 @@ class MambaPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
+    def get_mapping_lengths(self) -> list[int]:
+        token_layer_bytes = self.size * self.num_mamba_layers
+        return [
+            token_layer_bytes
+            * self.temporal_state_elem_size
+            * self.temporal_dtype.itemsize,
+            *(
+                token_layer_bytes * elem_size * self.conv_dtype.itemsize
+                for elem_size in self.conv_state_elem_sizes
+            ),
+        ]
+
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
 
@@ -171,6 +183,7 @@ class MambaPoolHost(HostKVCache):
                 device=device,
                 pin_memory=pin_memory,
                 allocator=allocator,
+                registration_granularity_bytes=int(np.prod(dims[1:])) * dtype.itemsize,
             )
 
         if self.layout in ["page_first", "page_first_direct"]:
@@ -762,8 +775,14 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.device_buffers = device_buffers
         self.gpu_device = device_buffers[0].device if device_buffers else device
 
-        requested_bytes = self.layer_num * num_host_pages * self.item_bytes
-        available_bytes = memory_available_bytes()
+        mapping_lengths = (
+            [num_host_pages * self.item_bytes] * self.layer_num
+            if layout == "layer_first"
+            else [num_host_pages * self.layer_num * self.item_bytes]
+        )
+        requested_bytes, available_bytes = host_memory_preflight(
+            mapping_lengths, self.allocator, self.gpu_device
+        )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for V4 paged pool {pool_name}. "
@@ -771,7 +790,13 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        alloc_func = ALLOC_MEMORY_FUNCS[
+            (
+                self.gpu_device.type
+                if isinstance(self.gpu_device, torch.device)
+                else str(self.gpu_device).partition(":")[0]
+            )
+        ]
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
@@ -781,6 +806,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
+                    registration_granularity_bytes=(
+                        self.layer_num * self.item_bytes
+                        if self.layout in ("page_first", "page_first_direct")
+                        else None
+                    ),
                 )
                 for _ in range(self.layer_num)
             ]
@@ -792,6 +822,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                registration_granularity_bytes=(
+                    self.layer_num * self.item_bytes
+                    if self.layout in ("page_first", "page_first_direct")
+                    else None
+                ),
             )
         elif self.layout == "page_first_direct":
             self.kv_buffer = alloc_func(
@@ -800,6 +835,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                registration_granularity_bytes=(
+                    self.layer_num * self.item_bytes
+                    if self.layout in ("page_first", "page_first_direct")
+                    else None
+                ),
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1158,8 +1198,14 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self._init_device_page_views()
         self.size_per_token = self.state_page_bytes
 
-        requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
-        available_bytes = memory_available_bytes()
+        mapping_lengths = (
+            [num_host_pages * self.state_page_bytes] * self.layer_num
+            if layout == "layer_first"
+            else [num_host_pages * self.layer_num * self.state_page_bytes]
+        )
+        requested_bytes, available_bytes = host_memory_preflight(
+            mapping_lengths, self.allocator, self.gpu_device
+        )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for V4 state pool {pool_name}. "
@@ -1167,7 +1213,13 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        alloc_func = ALLOC_MEMORY_FUNCS[
+            (
+                self.gpu_device.type
+                if isinstance(self.gpu_device, torch.device)
+                else str(self.gpu_device).partition(":")[0]
+            )
+        ]
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
@@ -1177,6 +1229,11 @@ class DeepSeekV4StateHostPool(HostKVCache):
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
+                    registration_granularity_bytes=(
+                        self.layer_num * self.state_page_bytes
+                        if self.layout in ("page_first", "page_first_direct")
+                        else None
+                    ),
                 )
                 for _ in range(self.layer_num)
             ]
@@ -1188,6 +1245,11 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                registration_granularity_bytes=(
+                    self.layer_num * self.state_page_bytes
+                    if self.layout in ("page_first", "page_first_direct")
+                    else None
+                ),
             )
         elif self.layout == "page_first_direct":
             self.kv_buffer = alloc_func(
@@ -1196,6 +1258,11 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                registration_granularity_bytes=(
+                    self.layer_num * self.state_page_bytes
+                    if self.layout in ("page_first", "page_first_direct")
+                    else None
+                ),
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1707,9 +1774,9 @@ class DSAIndexerPoolHost(HostKVCache):
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
 
-        buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
-        requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
-        available_bytes = memory_available_bytes()
+        requested_bytes, available_bytes = host_memory_preflight(
+            self.get_mapping_lengths(), self.allocator, self.device_pool.device
+        )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for DSA indexer hierarchical cache. "
@@ -1750,6 +1817,11 @@ class DSAIndexerPoolHost(HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                registration_granularity_bytes=(
+                    self.indexer_layout_dim
+                    if self.layout in ("page_first", "page_first_direct")
+                    else None
+                ),
             )
             self.index_k_data_refs = [
                 self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
@@ -1771,6 +1843,11 @@ class DSAIndexerPoolHost(HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                registration_granularity_bytes=(
+                    self.indexer_layout_dim
+                    if self.layout in ("page_first", "page_first_direct")
+                    else None
+                ),
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1796,6 +1873,15 @@ class DSAIndexerPoolHost(HostKVCache):
             dtype=self.indexer_dtype,
             device=self.device_pool.device,
         )
+
+    def get_mapping_lengths(self) -> list[int]:
+        # The indexer allocates a guard page beyond the anchor's token capacity.
+        return [
+            self.indexer_page_num
+            * self.layer_num
+            * self.indexer_page_stride_size
+            * self.indexer_dtype.itemsize
+        ]
 
     def get_hybrid_pool_buffer(self):
         return [self.index_k_with_scale_buffer]

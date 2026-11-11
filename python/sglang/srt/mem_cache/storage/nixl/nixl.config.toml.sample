@@ -5,10 +5,6 @@
 #    are mutually exclusive
 ################################################################################
 
-# Whether to enable the progress thread. Default: True
-# nixl_enable_prog_thread = true
-# Thread synchronization mode. Default: None
-# nixl_sync_mode = "strict"
 # HiCache host KV hugepages: set env SGLANG_HUGEPAGE_SIZE=2MB.
 # DOCA_MEMOS also requires SGLANG_HUGEPAGE_MODE=required.
 # Required for NIXL DOCA_MEMOS; reserve vm.nr_hugepages on the host.
@@ -117,6 +113,14 @@ num_threads = 4
 # Override endpoint (useful for non-AWS S3 services)
 endpoint_override = ""
 
+# Minimum object size (bytes) that uses the high-performance S3 CRT client.
+# Disabled by default. AWS S3 multipart uploads require parts of at least 5 MiB.
+crtMinLimit = 5242880
+
+# Target throughput for the S3 CRT client in whole Gbps, default: 10.
+# The CRT scheduler uses this value to size its parallel connection count.
+throughput_target_gbps = 25
+
 # Connection scheme: http or https, default: http
 scheme = "http"
 
@@ -152,4 +156,7 @@ bucket = ""
 # active = true
 # device_name = "/dev/ng0n1"  # NVMe namespace character device
 # nguid = "00000000000000000000000000000000"
-# query_mem_mode = "actual"  # required for correct HiCache existence checks
+# num_tasks = "8192"         # max concurrent DOCA tasks
+# convert_key_to_128bit = "false"
+#   false (default): SGLang hashes cache keys to 128-bit hex itself;
+#   true: the backend Blake2b-hashes full keys instead.
