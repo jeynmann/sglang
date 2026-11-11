@@ -253,9 +253,9 @@ class TestHostMemoryBudget(CustomTestCase):
             ),
             envs.SGLANG_HUGEPAGE_MODE.override("off"),
         ):
-            return base.host_memory_preflight().available_bytes
+            return base.host_memory_preflight(auto_size=True).available_bytes
 
-    def test_budget_is_split_across_co_located_ranks(self):
+    def test_auto_size_budget_is_split_across_co_located_ranks(self):
         solo = self._budget_with_ranks(1)
         self.assertEqual(self._budget_with_ranks(4), solo // 4)
 
@@ -302,7 +302,7 @@ class TestHostMemoryBudget(CustomTestCase):
             ),
         ):
             return base.host_memory_preflight(
-                allocator=allocator, device=device
+                allocator=allocator, device=device, auto_size=True
             ).available_bytes
 
     def test_budget_is_the_larger_of_plain_ram_and_the_hugetlb_pool(self):
@@ -411,7 +411,9 @@ class TestHostMemoryBudget(CustomTestCase):
                     return_value=base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 14 * gib,
                 ),
             ):
-                preflight = base.host_memory_preflight([6 * gib], allocator, "cuda")
+                preflight = base.host_memory_preflight(
+                    [6 * gib], allocator, "cuda", auto_size=True
+                )
                 self.assertEqual(preflight.allocation_bytes, 6 * gib)
                 self.assertEqual(preflight.available_bytes, 7 * gib)
         # Without SGLANG_HUGEPAGE_SIZE there is no page size to round to.

@@ -135,9 +135,9 @@ def host_memory_budget_plain_hugetlb(
 ) -> tuple[int, int]:
     """The (plain RAM, hugetlb pool) bytes this rank may claim for HiCache.
 
-    Bound machine availability by the visible cgroup limits before splitting
-    among local ranks. Independent engines with separate container budgets
-    therefore size against their own remaining allowance.
+    Bound machine availability by the visible cgroup limits. Auto-sizing
+    splits the snapshot among local ranks. Live allocation checks use the
+    remaining memory directly: other ranks may already have allocated pools.
     Auto-sizing requires successful cgroup discovery; explicit pool sizing
     can fall back to checking host availability when discovery fails.
     The pool is credited only when ``allocator`` (an instance, or its class
@@ -158,7 +158,7 @@ def host_memory_budget_plain_hugetlb(
             if free_hugetlb_bytes is None
             else free_hugetlb_bytes
         )
-    ranks = ranks_per_host()
+    ranks = ranks_per_host() if auto_size else 1
     return plain // ranks, pool // ranks
 
 
@@ -250,8 +250,8 @@ def host_memory_preflight(
         )
 
     # One snapshot per call: page size and mode derived and the pool read
-    # once. The split bills against this rank's pool share, not the
-    # host-wide pool.
+    # once. Only auto-sizing divides this snapshot among local ranks;
+    # allocation checks compare against the live remaining memory.
     page_size_and_mode = _hugetlb_page_size_and_mode(allocator, device)
     _, mode = page_size_and_mode
     free_hugetlb = allocator.free_hugetlb_bytes() if mode != HUGEPAGE_MODE_OFF else 0
