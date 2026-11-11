@@ -296,8 +296,10 @@ class TestHostMemoryBudget(CustomTestCase):
             unittest.mock.patch.object(
                 base, "available_host_memory_bytes", return_value=available
             ),
-            envs.SGLANG_HUGEPAGE_MODE.override(mode),
-            envs.SGLANG_HUGEPAGE_SIZE.override(size),
+            unittest.mock.patch.dict(
+                "os.environ",
+                {"SGLANG_HUGEPAGE_MODE": mode, "SGLANG_HUGEPAGE_SIZE": size},
+            ),
         ):
             return base.host_memory_preflight(
                 allocator=allocator, device=device

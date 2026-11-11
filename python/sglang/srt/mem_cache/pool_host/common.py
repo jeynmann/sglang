@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 from collections import defaultdict
 from typing import Union
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
     alloc_mmap,
     hugepage_size_requested,
@@ -18,8 +16,6 @@ from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
 )
 
 logger = logging.getLogger(__name__)
-
-_CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 
 
 class HostTensorAllocator:
@@ -142,107 +138,33 @@ def get_allocator_type(server_args) -> str:
     return backend or "default"
 
 
-def _cuda_host_register(
-    buffer: torch.Tensor, registration_granularity_bytes: int | None = None
-) -> None:
-    # Avoid oversized cudaHostRegister calls on large host pools.
+def _cuda_host_register(buffer: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
-    base = buffer.data_ptr()
-    total = buffer.numel() * buffer.element_size()
-    # cudaHostRegister requires hugetlb-backed ranges whose base or size are
-    # hugepage-aligned, so round the size up to the hugepage size.
-    hugepage_size = hugepage_size_requested() if tensor_uses_hugepage(buffer) else 0
-    if hugepage_size:
-        total = -(-total // hugepage_size) * hugepage_size
-    chunk_limit_bytes = (
-        max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
-    )
-    # Preserve the legacy single-call behavior unless the caller provides a
-    # copy granularity. Splitting an unknown page-first layout at an arbitrary
-    # byte offset can make one cudaMemcpyBatchAsync span two registrations.
-    chunk_bytes = total
-    if registration_granularity_bytes is not None:
-        if registration_granularity_bytes <= 0:
-            raise ValueError(
-                "registration_granularity_bytes must be positive, got "
-                f"{registration_granularity_bytes}"
-            )
-        # Every internal boundary must align to both a complete copy unit and
-        # a hugepage. Rounding to either grid separately can break the other.
-        alignment_bytes = math.lcm(registration_granularity_bytes, hugepage_size or 1)
-        if alignment_bytes > chunk_limit_bytes:
-            raise ValueError(
-                "Host registration alignment exceeds the configured chunk limit: "
-                f"granularity={registration_granularity_bytes}, "
-                f"hugepage={hugepage_size}, alignment={alignment_bytes}, "
-                f"chunk_limit={chunk_limit_bytes}"
-            )
-        chunk_bytes = (chunk_limit_bytes // alignment_bytes) * alignment_bytes
-    registered_ranges: list[tuple[int, int]] = []
-    try:
-        offset = 0
-        while offset < total:
-            size = min(chunk_bytes, total - offset)
-            ptr = base + offset
-            rc = int(cudart.cudaHostRegister(ptr, size, 0))
-            if rc != 0:
-                raise RuntimeError(
-                    f"cudaHostRegister failed (rc={rc}, "
-                    f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
-                    f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
-                    f"pinned and device transfers may silently return stale data."
-                )
-            registered_ranges.append((ptr, size))
-            offset += size
-
-        # Keep the exact registration bases alive with the tensor. CUDA requires
-        # cudaHostUnregister to receive each base pointer, not just the tensor's
-        # original base once after several independent registrations.
-        setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, registered_ranges)
-    except Exception:
-        remaining_ranges = _cuda_host_unregister_ranges(
-            cudart, registered_ranges, operation="registration rollback"
+    n_bytes = buffer.numel() * buffer.element_size()
+    if tensor_uses_hugepage(buffer):
+        page_size = hugepage_size_requested()
+        n_bytes = -(-n_bytes // page_size) * page_size
+    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
+    if int(rc) != 0:
+        raise RuntimeError(
+            f"cudaHostRegister failed (rc={int(rc)}, "
+            f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
+            f"size={n_bytes}; host buffer is not pinned and device transfers "
+            f"may silently return stale data."
         )
-        if remaining_ranges:
-            setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
-        raise
-
-
-def _cuda_host_unregister_ranges(
-    cudart, registered_ranges: list[tuple[int, int]], *, operation: str
-) -> list[tuple[int, int]]:
-    failed_ranges = []
-    for ptr, size in reversed(registered_ranges):
-        rc = int(cudart.cudaHostUnregister(ptr))
-        if rc != 0:
-            failed_ranges.append((ptr, size))
-            logger.warning(
-                "cudaHostUnregister failed during %s (rc=%d, %s) for ptr=%#x size=%d",
-                operation,
-                rc,
-                cudart.cudaGetErrorString(rc),
-                ptr,
-                size,
-            )
-    failed_ranges.reverse()
-    return failed_ranges
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
-    registered_ranges = getattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, None)
-    if registered_ranges is None:
-        # Compatibility for buffers registered before range metadata was added.
-        registered_ranges = [
-            (buffer.data_ptr(), buffer.numel() * buffer.element_size())
-        ]
-    if not registered_ranges:
-        return
-
-    remaining_ranges = _cuda_host_unregister_ranges(
-        cudart, registered_ranges, operation="host-pool destroy"
-    )
-    setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
+    rc = cudart.cudaHostUnregister(buffer.data_ptr())
+    if int(rc) != 0:
+        # Best-effort on shutdown: warn, don't raise -- a leak is reclaimed at exit.
+        logger.warning(
+            "cudaHostUnregister failed (rc=%d, %s) for ptr=%#x",
+            int(rc),
+            cudart.cudaGetErrorString(rc),
+            buffer.data_ptr(),
+        )
 
 
 def alloc_with_host_register(
@@ -251,7 +173,6 @@ def alloc_with_host_register(
     device: str,
     pin_memory: bool,
     allocator: HostTensorAllocator,
-    registration_granularity_bytes: int | None = None,
 ) -> torch.Tensor:
     """
     Allocate tensor and register host memory with cudaHostRegister.
@@ -259,7 +180,7 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        _cuda_host_register(buffer, registration_granularity_bytes)
+        _cuda_host_register(buffer)
     return buffer
 
 
@@ -269,7 +190,6 @@ def alloc_with_pin_memory(
     device: str,
     pin_memory: bool,
     allocator: None,
-    registration_granularity_bytes: int | None = None,
 ) -> torch.Tensor:
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.

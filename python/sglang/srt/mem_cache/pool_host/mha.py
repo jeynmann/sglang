@@ -120,9 +120,6 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
         self._init_write_back_staging_buffers()
 
-    def get_hybrid_pool_buffer(self):
-        return [self.k_buffer, self.v_buffer]
-
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
@@ -167,11 +164,6 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
-            registration_granularity_bytes=(
-                self.page_size * self.layout_dim
-                if self.layout in ("page_first", "page_first_direct")
-                else None
-            ),
         )
         return buffer
 
@@ -738,30 +730,10 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
-            registration_granularity_bytes=(
-                self.page_size * self.layout_dim
-                if self.layout in ("page_first", "page_first_direct")
-                else None
-            ),
         )
 
     def get_hybrid_pool_buffer(self):
         return [self.k_buffer]
-
-    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        if self.layout not in ("page_first", "page_first_direct"):
-            return False
-        page_stride_bytes = (
-            self.layer_num
-            * self.page_size
-            * self.head_num
-            * self.head_dim
-            * self.dtype.itemsize
-        )
-        return (
-            self.k_buffer.data_ptr() % page_size_bytes == 0
-            and page_stride_bytes % page_size_bytes == 0
-        )
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
@@ -1094,7 +1066,6 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
-            registration_granularity_bytes=self.page_size * self._k_layout_dim(),
         )
         v_buffer = alloc_func(
             v_dims,
@@ -1102,12 +1073,8 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
-            registration_granularity_bytes=self.page_size * self._v_layout_dim(),
         )
         return (k_buffer, v_buffer)
-
-    def get_hybrid_pool_buffer(self):
-        return [self.k_buffer, self.v_buffer]
 
     def _k_token_stride_size(self) -> int:
         return self.head_num * self.head_dim * self.dtype.itemsize

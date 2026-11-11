@@ -164,14 +164,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
-                registration_granularity_bytes=(
-                    self.page_size
-                    * self.layer_num
-                    * self.kv_cache_dim
-                    * self.dtype.itemsize
-                    if self.layout in ("page_first", "page_first_direct")
-                    else None
-                ),
             )
             self.v_buffer = alloc_func(
                 (*base_dims, self.qk_rope_head_dim),
@@ -179,14 +171,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
-                registration_granularity_bytes=(
-                    self.page_size
-                    * self.layer_num
-                    * self.kv_cache_dim
-                    * self.dtype.itemsize
-                    if self.layout in ("page_first", "page_first_direct")
-                    else None
-                ),
             )
             self.index_k_buffer = None
             if self.device_pool.index_head_dim is not None:
@@ -196,14 +180,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
-                    registration_granularity_bytes=(
-                        self.page_size
-                        * self.layer_num
-                        * self.kv_cache_dim
-                        * self.dtype.itemsize
-                        if self.layout in ("page_first", "page_first_direct")
-                        else None
-                    ),
                 )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
@@ -220,14 +196,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
-            registration_granularity_bytes=(
-                self.page_size
-                * self.layer_num
-                * self.kv_cache_dim
-                * self.dtype.itemsize
-                if self.layout in ("page_first", "page_first_direct")
-                else None
-            ),
         )
         return buffer
 

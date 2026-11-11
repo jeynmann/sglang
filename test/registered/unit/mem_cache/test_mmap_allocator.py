@@ -1,25 +1,22 @@
-import ctypes
-import ctypes.util
-import mmap
-import os
-import sys
 import tempfile
-import unittest
-import unittest.mock
-
-import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm, mmap_allocator
-from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
-    _mmap_prefaulted,
-    tensor_uses_hugepage,
-)
+from sglang.srt.mem_cache.storage.mmap import mmap_allocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+import sys
+
 sys.modules["libtpu"] = None
+import mmap
+import os
+import unittest
+
+import torch
+
+from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm
 
 
 class TestMmapAllocator(unittest.TestCase):
@@ -225,175 +222,6 @@ class TestMmapAllocator(unittest.TestCase):
         with self.assertRaises(AssertionError) as ctx:
             allocator.allocate((2, 2), torch.float32, device="cuda")
         self.assertIn("only supports CPU allocations", str(ctx.exception))
-
-
-class TestHugepageMmapAllocator(unittest.TestCase):
-    def test_hugepage_override_restores_after_allocation_error(self):
-        with (
-            envs.SGLANG_HUGEPAGE_MODE.override("off"),
-            envs.SGLANG_HUGEPAGE_SIZE.override(""),
-        ):
-            with self.assertRaisesRegex(ValueError, "SGLANG_HUGEPAGE_SIZE"):
-                with envs.SGLANG_HUGEPAGE_MODE.override("required"):
-                    mmap_allocator.alloc_mmap((4,), torch.float32)
-            self.assertEqual(envs.SGLANG_HUGEPAGE_MODE.get(), "off")
-            self.assertEqual(envs.SGLANG_HUGEPAGE_SIZE.get(), "")
-
-    def test_alloc_mmap_hugepage_modes(self):
-        with (
-            self.subTest(mode="off"),
-            envs.SGLANG_HUGEPAGE_MODE.override("off"),
-            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
-            unittest.mock.patch.object(mmap_allocator, "_alloc_hugepage") as hugepage,
-        ):
-            self.assertEqual(mmap_allocator.alloc_mmap((4,), torch.float32).shape, (4,))
-            hugepage.assert_not_called()
-
-        with (
-            self.subTest(mode="prefer", result="hugetlb"),
-            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
-            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
-            unittest.mock.patch.object(
-                mmap_allocator,
-                "_alloc_hugepage",
-                return_value=(ctypes.c_uint8 * 16)(),
-            ) as hugepage,
-            unittest.mock.patch.object(mmap_allocator, "_mmap_prefaulted") as plain,
-        ):
-            self.assertEqual(mmap_allocator.alloc_mmap((4,), torch.float32).shape, (4,))
-            hugepage.assert_called_once()
-            plain.assert_not_called()
-
-        with (
-            self.subTest(mode="prefer", result="fallback"),
-            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
-            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
-            unittest.mock.patch.object(mmap_allocator, "_libc", object()),
-            unittest.mock.patch.object(
-                mmap_allocator,
-                "_alloc_hugepage",
-                side_effect=OSError("no hugepages"),
-            ),
-            unittest.mock.patch.object(
-                mmap_allocator,
-                "_mmap_prefaulted",
-                wraps=mmap_allocator._mmap_prefaulted,
-            ) as plain,
-        ):
-            self.assertEqual(mmap_allocator.alloc_mmap((4,), torch.float32).shape, (4,))
-            plain.assert_called_once()
-
-        with (
-            self.subTest(mode="required", result="failure"),
-            envs.SGLANG_HUGEPAGE_MODE.override("required"),
-            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
-            unittest.mock.patch.object(mmap_allocator, "_libc", object()),
-            unittest.mock.patch.object(
-                mmap_allocator,
-                "_alloc_hugepage",
-                side_effect=OSError("no hugepages"),
-            ),
-            unittest.mock.patch.object(mmap_allocator, "_mmap_prefaulted") as plain,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "no hugepages"):
-                mmap_allocator.alloc_mmap((4,), torch.float32)
-            plain.assert_not_called()
-
-        with (
-            self.subTest(mode="required", result="missing-size"),
-            envs.SGLANG_HUGEPAGE_MODE.override("required"),
-            envs.SGLANG_HUGEPAGE_SIZE.override(""),
-            self.assertRaisesRegex(ValueError, "SGLANG_HUGEPAGE_SIZE"),
-        ):
-            mmap_allocator.alloc_mmap((4,), torch.float32)
-
-        with (
-            self.subTest(mode="required", result="libc-unavailable"),
-            envs.SGLANG_HUGEPAGE_MODE.override("required"),
-            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
-            unittest.mock.patch.object(mmap_allocator, "_libc", None),
-            self.assertRaisesRegex(RuntimeError, "C library"),
-        ):
-            mmap_allocator.alloc_mmap((4,), torch.float32)
-
-    def test_alloc_mmap_marks_only_hugepage_mappings(self):
-        with (
-            envs.SGLANG_HUGEPAGE_MODE.override("off"),
-            envs.SGLANG_HUGEPAGE_SIZE.override(""),
-        ):
-            buf = mmap_allocator.alloc_mmap((4,), torch.float32)
-            self.assertFalse(tensor_uses_hugepage(buf))
-
-        with (
-            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
-            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
-            unittest.mock.patch.object(
-                mmap_allocator,
-                "_alloc_hugepage",
-                return_value=(ctypes.c_uint8 * 16)(),
-            ),
-        ):
-            buf = mmap_allocator.alloc_mmap((4,), torch.float32)
-            self.assertTrue(tensor_uses_hugepage(buf))
-        # A freed buffer must not stay marked as hugepage-backed.
-        del buf
-        self.assertEqual(mmap_allocator._hugepage_storage_keys, set())
-
-        # Prefer-mode fallback to plain pages must not register as hugepage.
-        with (
-            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
-            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
-            unittest.mock.patch.object(mmap_allocator, "_libc", object()),
-            unittest.mock.patch.object(
-                mmap_allocator,
-                "_alloc_hugepage",
-                side_effect=OSError("no hugepages"),
-            ),
-        ):
-            buf = mmap_allocator.alloc_mmap((4,), torch.float32)
-            self.assertFalse(tensor_uses_hugepage(buf))
-
-    def _assert_resident(self, mm, alloc_bytes):
-        # mincore() reports per-page residency, so the invariant is checked
-        # rather than inferred from the flags that were passed.
-        addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-        npages = alloc_bytes // mmap.PAGESIZE
-        vec = (ctypes.c_ubyte * npages)()
-        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        if libc.mincore(ctypes.c_void_p(addr), ctypes.c_size_t(alloc_bytes), vec) != 0:
-            self.skipTest("mincore unavailable")
-        self.assertTrue(all(v & 1 for v in vec), "mapping was not fully pre-faulted")
-
-    def test_mmap_prefaulted_leaves_no_lazy_page(self):
-        """Both populate paths must return a mapping with every page resident.
-
-        cudaHostRegister pins these buffers, so a page still unfaulted at
-        registration lets the device read memory that is not backed yet.
-        """
-        alloc_bytes = 64 * mmap.PAGESIZE
-        flags = mmap.MAP_SHARED | mmap.MAP_ANONYMOUS
-
-        with self.subTest(path="madvise"):
-            mm = _mmap_prefaulted(-1, alloc_bytes, flags)
-            try:
-                self._assert_resident(mm, alloc_bytes)
-            finally:
-                mm.close()
-
-        # MAP_POPULATE is unreachable on a 5.14+ kernel, so CI never runs it;
-        # force the branch or it ships untested.
-        with (
-            self.subTest(path="map_populate"),
-            unittest.mock.patch(
-                "sglang.srt.mem_cache.storage.mmap.mmap_allocator._has_madv_populate_write",
-                return_value=False,
-            ),
-        ):
-            mm = _mmap_prefaulted(-1, alloc_bytes, flags)
-            try:
-                self._assert_resident(mm, alloc_bytes)
-            finally:
-                mm.close()
 
 
 class TestHugetlbPool(unittest.TestCase):

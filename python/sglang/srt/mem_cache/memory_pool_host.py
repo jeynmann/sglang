@@ -183,7 +183,6 @@ class MambaPoolHost(HostKVCache):
                 device=device,
                 pin_memory=pin_memory,
                 allocator=allocator,
-                registration_granularity_bytes=int(np.prod(dims[1:])) * dtype.itemsize,
             )
 
         if self.layout in ["page_first", "page_first_direct"]:
@@ -806,11 +805,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
-                    registration_granularity_bytes=(
-                        self.layer_num * self.item_bytes
-                        if self.layout in ("page_first", "page_first_direct")
-                        else None
-                    ),
                 )
                 for _ in range(self.layer_num)
             ]
@@ -822,11 +816,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
-                registration_granularity_bytes=(
-                    self.layer_num * self.item_bytes
-                    if self.layout in ("page_first", "page_first_direct")
-                    else None
-                ),
             )
         elif self.layout == "page_first_direct":
             self.kv_buffer = alloc_func(
@@ -835,11 +824,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
-                registration_granularity_bytes=(
-                    self.layer_num * self.item_bytes
-                    if self.layout in ("page_first", "page_first_direct")
-                    else None
-                ),
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1229,11 +1213,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
-                    registration_granularity_bytes=(
-                        self.layer_num * self.state_page_bytes
-                        if self.layout in ("page_first", "page_first_direct")
-                        else None
-                    ),
                 )
                 for _ in range(self.layer_num)
             ]
@@ -1245,11 +1224,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
-                registration_granularity_bytes=(
-                    self.layer_num * self.state_page_bytes
-                    if self.layout in ("page_first", "page_first_direct")
-                    else None
-                ),
             )
         elif self.layout == "page_first_direct":
             self.kv_buffer = alloc_func(
@@ -1258,11 +1232,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
-                registration_granularity_bytes=(
-                    self.layer_num * self.state_page_bytes
-                    if self.layout in ("page_first", "page_first_direct")
-                    else None
-                ),
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1817,11 +1786,6 @@ class DSAIndexerPoolHost(HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
-                registration_granularity_bytes=(
-                    self.indexer_layout_dim
-                    if self.layout in ("page_first", "page_first_direct")
-                    else None
-                ),
             )
             self.index_k_data_refs = [
                 self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
@@ -1843,11 +1807,6 @@ class DSAIndexerPoolHost(HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
-                registration_granularity_bytes=(
-                    self.indexer_layout_dim
-                    if self.layout in ("page_first", "page_first_direct")
-                    else None
-                ),
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
